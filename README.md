@@ -1,3 +1,9 @@
+🚨 **PLEASE READ BEFORE DOWNLOADING (Early Beta & Manage Your Expectations):**
+This is **v0.1.0 — an early, experimental beta**, and **I really don't want to overpromise here!** Please **only download this if you enjoy testing raw, early software and fully expect that things might fail or not work on your setup.**
+* **Your mileage WILL vary:** While I had a few successful test runs on my own discs (tested South Park Season 6 (USA Blu-ray), Walking Dead Season 1 (German Blu-ray), The Americans Season 1 (UK Blu-ray) and Castle Rock Season 1 (German Blu-Ray)), a lot of the matching logic (especially the subtitle comparison) is still heavily based on theory. Just because it worked on my test rips does **not** mean you will automatically get the same results on yours!
+* **USE AT YOUR OWN RISK — NO GUARANTEES:** Even though the renamer has an undo journal, **DO NOT run this on video files you don't have a backup of** (or can't easily re-rip). Always test on a backup copy first! I take zero responsibility for mangled filenames or broken MKV headers.
+
+
 # EpisodeMatch
 
 **Identify every episode in your MakeMKV rips — with evidence, not guesswork.**
