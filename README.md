@@ -265,6 +265,14 @@ results.
 .venv\Scripts\python -m pytest tests\
 ```
 
+
+
+## Acknowledgments & Attribution
+
+* **TMDB:** This product uses the TMDB API but is not endorsed or certified by TMDB. Free TMDB API keys are licensed for non-commercial use only.
+* **TheDiscDB:** Disc fingerprint data is powered by the community project [TheDiscDb/data](https://github.com/TheDiscDb/data) (MIT License).
+* **Subtitles:** Reference subtitle matching is supported via [SubDL](https://subdl.com) and [OpenSubtitles](https://opensubtitles.com) (users must provide their own personal API keys and abide by the respective provider's terms of service and daily rate limits).
+
 ---
 
 # EpisodeMatch (Deutsche Kurzfassung)
