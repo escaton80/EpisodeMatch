@@ -1,0 +1,266 @@
+"""Tests for the renamer: templates, sanitizing, collisions, dry-run, undo journal."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from episodematch.core.config import format_episode_name, sanitize_filename
+from episodematch.core.exceptions import RenameError
+from episodematch.core.models import AssignmentEntry
+from episodematch.postprocess.renamer import (
+    RenamePlan,
+    RenamePlanItem,
+    Renamer,
+    build_rename_plan,
+)
+
+
+def entry(folder: Path, file_name: str, season: int, episode: int, title: str) -> AssignmentEntry:
+    return AssignmentEntry(
+        file_path=folder / file_name,
+        season=season,
+        episode=episode,
+        episode_title=title,
+        confidence=0.9,
+    )
+
+
+@pytest.fixture()
+def rips(tmp_path: Path) -> Path:
+    folder = tmp_path / "rips"
+    folder.mkdir()
+    for name in ("title_t00.mkv", "title_t01.mkv"):
+        (folder / name).write_bytes(b"\x1a\x45\xdf\xa3fake")
+    return folder
+
+
+class TestSanitizeFilename:
+    def test_illegal_characters_replaced(self) -> None:
+        assert sanitize_filename('a<b>c:d"e/f\\g|h?i*j') == "a_b_c_d_e_f_g_h_i_j"
+
+    def test_control_characters_replaced(self) -> None:
+        assert sanitize_filename("a\x00b\x1fc") == "a_b_c"
+
+    def test_windows_reserved_names(self) -> None:
+        assert sanitize_filename("CON") == "_CON"
+        assert sanitize_filename("nul.txt") == "_nul.txt"
+        assert sanitize_filename("com1") == "_com1"
+
+    def test_trailing_dots_and_spaces(self) -> None:
+        assert sanitize_filename("name... ") == "name"
+
+    def test_empty_becomes_underscore(self) -> None:
+        assert sanitize_filename("   ") == "_"
+
+    def test_max_length(self) -> None:
+        assert len(sanitize_filename("x" * 500, max_length=100)) == 100
+
+
+class TestFormatEpisodeName:
+    def test_default_template(self) -> None:
+        result = format_episode_name(
+            "{series}/Season {season:02d}/{series} - S{season:02d}E{episode:02d} - {title}",
+            series="Breaking Bad",
+            season=1,
+            episode=3,
+            title="...And the Bag's in the River",
+            extension="",
+        )
+        parts = result.split("/")
+        assert parts[0] == "Breaking Bad"
+        assert parts[1] == "Season 01"
+        # Leading dots of a *component* are stripped; inner dots survive (Windows-legal).
+        assert parts[2] == "Breaking Bad - S01E03 - ...And the Bag's in the River"
+
+    def test_leading_dots_of_component_stripped(self) -> None:
+        assert sanitize_filename(".hidden") == "hidden"
+        assert sanitize_filename("...dots") == "dots"
+
+    def test_inner_dots_survive(self) -> None:
+        assert sanitize_filename("Mr. Robot") == "Mr. Robot"
+
+    def test_extension_handling(self) -> None:
+        result = format_episode_name(
+            "{series} - S{season:02d}E{episode:02d} - {title}",
+            series="X",
+            season=1,
+            episode=1,
+            title="T",
+        )
+        assert result == "X - S01E01 - T.mkv"
+
+    def test_padding_and_extension(self) -> None:
+        result = format_episode_name("{series} - S{season:02d}E{episode:03d} - {title}", series="X", season=2, episode=7, title="T", extension=".mp4")
+        assert result == "X - S02E007 - T.mp4"
+
+    def test_unknown_placeholder_raises(self) -> None:
+        from episodematch.core.exceptions import ConfigError
+
+        with pytest.raises(ConfigError):
+            format_episode_name("{bogus}", series="s", season=1, episode=1, title="t")
+
+    def test_nested_folders_sanitized(self) -> None:
+        result = format_episode_name("{series}/Season {season:02d}/{series} - {title}", series="Show: The Series", season=1, episode=1, title="What? Why?")
+        assert ":" not in result and "?" not in result
+
+
+class TestBuildRenamePlan:
+    def test_plan_with_season_folder(self, rips: Path) -> None:
+        plan = build_rename_plan(
+            [entry(rips, "title_t00.mkv", 1, 1, "Pilot"), entry(rips, "title_t01.mkv", 1, 2, "Cat's in the Bag...")],
+            series="Breaking Bad",
+            template="{series}/Season {season:02d}/{series} - S{season:02d}E{episode:02d} - {title}",
+            dry_run=True,
+        )
+        assert len(plan.items) == 2
+        first = plan.items[0]
+        assert first.destination.parent.name == "Season 01"
+        assert first.destination.name == "Breaking Bad - S01E01 - Pilot.mkv"
+        assert not plan.is_empty
+
+    def test_plan_without_season_folder(self, rips: Path) -> None:
+        plan = build_rename_plan(
+            [entry(rips, "title_t00.mkv", 1, 1, "Pilot")],
+            series="Breaking Bad",
+            template="{series}/Season {season:02d}/{series} - S{season:02d}E{episode:02d} - {title}",
+            season_folder=False,
+            dry_run=True,
+        )
+        # The "Season 01" component is dropped; the series folder from the template stays.
+        assert plan.items[0].destination.parent == rips / "Breaking Bad"
+        assert plan.items[0].destination.name == "Breaking Bad - S01E01 - Pilot.mkv"
+
+    def test_missing_title_gets_placeholder(self, rips: Path) -> None:
+        item = AssignmentEntry(file_path=rips / "title_t00.mkv", season=1, episode=5, episode_title=None, confidence=0.5)
+        plan = build_rename_plan([item], series="Show", template="{series} - S{season:02d}E{episode:02d} - {title}", dry_run=True)
+        assert "Episode 5" in plan.items[0].destination.name
+
+    def test_collision_with_existing_file(self, rips: Path) -> None:
+        (rips / "Show - S01E01 - Pilot.mkv").write_bytes(b"x")
+        plan = build_rename_plan(
+            [entry(rips, "title_t00.mkv", 1, 1, "Pilot")],
+            series="Show",
+            template="{series} - S{season:02d}E{episode:02d} - {title}",
+            dry_run=True,
+        )
+        assert plan.items[0].destination.name == "Show - S01E01 - Pilot (2).mkv"
+
+    def test_conflicts_within_plan_detected(self, rips: Path) -> None:
+        item = RenamePlanItem(source=rips / "a.mkv", destination=rips / "same.mkv")
+        plan = RenamePlan(items=[item, item.model_copy()], dry_run=True)
+        assert len(plan.conflicts_within_plan()) == 1
+
+
+class TestRenamerApply:
+    def test_dry_run_changes_nothing(self, rips: Path, tmp_path: Path) -> None:
+        plan = build_rename_plan(
+            [entry(rips, "title_t00.mkv", 1, 1, "Pilot")],
+            series="Show",
+            template="{series} - S{season:02d}E{episode:02d} - {title}",
+            dry_run=True,
+        )
+        renamer = Renamer(tmp_path / "undo")
+        applied = renamer.apply(plan)
+        assert len(applied) == 1
+        assert (rips / "title_t00.mkv").is_file()
+        assert not (rips / "Show - S01E01 - Pilot.mkv").exists()
+        assert renamer.list_journals() == []
+
+    def test_apply_renames_and_journals(self, rips: Path, tmp_path: Path) -> None:
+        plan = build_rename_plan(
+            [entry(rips, "title_t00.mkv", 1, 1, "Pilot"), entry(rips, "title_t01.mkv", 1, 2, "Second")],
+            series="Show",
+            template="{series} - S{season:02d}E{episode:02d} - {title}",
+            dry_run=False,
+        )
+        renamer = Renamer(tmp_path / "undo")
+        applied = renamer.apply(plan)
+        assert len(applied) == 2
+        assert (rips / "Show - S01E01 - Pilot.mkv").is_file()
+        assert (rips / "Show - S01E02 - Second.mkv").is_file()
+        assert not (rips / "title_t00.mkv").exists()
+        journals = renamer.list_journals()
+        assert len(journals) == 1
+        payload = json.loads(journals[0].read_text(encoding="utf-8"))
+        assert len(payload["operations"]) == 2
+
+    def test_validate_rejects_missing_source(self, rips: Path, tmp_path: Path) -> None:
+        plan = build_rename_plan(
+            [entry(rips, "title_t00.mkv", 1, 1, "Pilot")],
+            series="Show",
+            template="{series} - S{season:02d}E{episode:02d} - {title}",
+            dry_run=False,
+        )
+        (rips / "title_t00.mkv").unlink()
+        renamer = Renamer(tmp_path / "undo")
+        with pytest.raises(RenameError):
+            renamer.apply(plan)
+
+    def test_validate_rejects_existing_destination(self, rips: Path, tmp_path: Path) -> None:
+        plan = build_rename_plan(
+            [entry(rips, "title_t00.mkv", 1, 1, "Pilot")],
+            series="Show",
+            template="{series} - S{season:02d}E{episode:02d} - {title}",
+            dry_run=False,
+        )
+        (rips / "Show - S01E01 - Pilot.mkv").write_bytes(b"existing")
+        renamer = Renamer(tmp_path / "undo")
+        with pytest.raises(RenameError):
+            renamer.apply(plan)
+
+
+class TestUndo:
+    def test_undo_latest_restores_state(self, rips: Path, tmp_path: Path) -> None:
+        plan = build_rename_plan(
+            [entry(rips, "title_t00.mkv", 1, 1, "Pilot"), entry(rips, "title_t01.mkv", 1, 2, "Second")],
+            series="Show",
+            template="{series} - S{season:02d}E{episode:02d} - {title}",
+            dry_run=False,
+        )
+        renamer = Renamer(tmp_path / "undo")
+        renamer.apply(plan)
+        restored = renamer.undo_latest()
+        assert len(restored) == 2
+        assert (rips / "title_t00.mkv").is_file()
+        assert (rips / "title_t01.mkv").is_file()
+        assert not (rips / "Show - S01E01 - Pilot.mkv").exists()
+        assert renamer.list_journals() == []
+
+    def test_undo_with_season_folder_prunes_empty_dir(self, rips: Path, tmp_path: Path) -> None:
+        plan = build_rename_plan(
+            [entry(rips, "title_t00.mkv", 1, 1, "Pilot")],
+            series="Show",
+            template="{series}/Season {season:02d}/{series} - S{season:02d}E{episode:02d} - {title}",
+            dry_run=False,
+        )
+        renamer = Renamer(tmp_path / "undo")
+        renamer.apply(plan)
+        season_dir = rips / "Show" / "Season 01"
+        assert (season_dir / "Show - S01E01 - Pilot.mkv").is_file()
+        renamer.undo_latest()
+        assert (rips / "title_t00.mkv").is_file()
+        assert not season_dir.exists()  # empty season folder pruned
+
+    def test_undo_without_journal_raises(self, tmp_path: Path) -> None:
+        renamer = Renamer(tmp_path / "undo")
+        with pytest.raises(RenameError):
+            renamer.undo_latest()
+
+    def test_undo_roundtrip_twice(self, rips: Path, tmp_path: Path) -> None:
+        renamer = Renamer(tmp_path / "undo")
+        template = "{series} - S{season:02d}E{episode:02d} - {title}"
+        for episode, title in ((1, "Pilot"), (2, "Second")):
+            plan = build_rename_plan(
+                [entry(rips, f"title_t0{episode - 1}.mkv", 1, episode, title)],
+                series="Show",
+                template=template,
+                dry_run=False,
+            )
+            renamer.apply(plan)
+        renamer.undo_latest()
+        renamer.undo_latest()
+        assert (rips / "title_t00.mkv").is_file()
+        assert (rips / "title_t01.mkv").is_file()

@@ -1,0 +1,41 @@
+# --- Local tool binaries (downloaded at runtime, not distributed) ---
+bin/*
+!bin/.gitkeep
+
+# --- Local caches: SQLite DB, temp frames, subtitles, undo journals ---
+data/*
+!data/.gitkeep
+
+# --- ZCode session artifacts ---
+.zcode/
+
+# --- Python ---
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+wheels/
+
+# --- Test / tooling caches ---
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.ruff_cache/
+.mypy_cache/
+
+# --- Environments & secrets ---
+.env
+.env.*
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini

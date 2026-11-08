@@ -1,0 +1,84 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "episodematch"
+version = "0.1.0"
+description = "Identify ripped Blu-ray/DVD .mkv episode files with near-100% certainty using a five-pillar matching engine."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+authors = [{ name = "EpisodeMatch contributors" }]
+keywords = ["makemkv", "bluray", "dvd", "plex", "jellyfin", "emby", "renamer", "episodes", "pgs", "subtitles"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Environment :: Win32 (MS Windows)",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Video",
+]
+dependencies = [
+    "pydantic>=2.7",
+    "httpx>=0.27",
+    "numpy>=1.26",
+    "pillow>=10.3",
+    "rapidfuzz>=3.6",
+    "scipy>=1.13",
+    "beautifulsoup4>=4.12",
+]
+
+[project.optional-dependencies]
+gui = ["PySide6>=6.7"]
+audio = ["faster-whisper>=1.0"]
+ocr = [
+    "rapidocr-onnxruntime>=1.3",
+    "pytesseract>=0.3.10",
+]
+ocr-winrt = [
+    "winrt-runtime>=2.1; sys_platform == 'win32'",
+    "winrt-Windows.Media.Ocr>=2.1; sys_platform == 'win32'",
+    "winrt-Windows.Graphics.Imaging>=2.1; sys_platform == 'win32'",
+    "winrt-Windows.Globalization>=2.1; sys_platform == 'win32'",
+    "winrt-Windows.Storage.Streams>=2.1; sys_platform == 'win32'",
+]
+downloader = ["py7zr>=23.12"]
+dev = [
+    "pytest>=8.2",
+    "pytest-cov>=5.0",
+    "pytest-timeout>=2.3",
+]
+pack = ["pyinstaller>=6.6"]
+
+[project.scripts]
+episodematch = "episodematch.main:main"
+
+[project.urls]
+Homepage = "https://github.com/episodematch/episodematch"
+Documentation = "https://github.com/episodematch/episodematch#readme"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/episodematch"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+timeout = 120
+markers = [
+    "network: tests that require internet access (deselected by default)",
+]
+
+[tool.coverage.run]
+source = ["src/episodematch"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501"]

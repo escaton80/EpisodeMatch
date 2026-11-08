@@ -1,0 +1,535 @@
+"""Tests for binaries locator, downloader internals, config/env handling and the CLI."""
+
+from __future__ import annotations
+
+import io
+import json
+import subprocess
+import zipfile
+from pathlib import Path
+
+import httpx
+import pytest
+
+from episodematch.core.bin_downloader import (
+    BinaryDownloader,
+    choose_mkvtoolnix_archive,
+    collect_executables,
+    parse_mkvtoolnix_versions,
+    safe_extract_zip,
+    validate_zip_member,
+)
+from episodematch.core.binaries import ToolResolver, locate_tool, probe_version
+from episodematch.core.config import AppConfig, apply_env_overrides
+from episodematch.core.exceptions import BinaryDownloadError, BinaryNotFoundError, ConfigError
+from episodematch.core.database import CacheDatabase
+from episodematch.main import main
+
+# ---------------------------------------------------------------------------
+# Zip safety
+# ---------------------------------------------------------------------------
+
+
+class TestZipSafety:
+    def test_valid_names_pass(self) -> None:
+        validate_zip_member("ffmpeg/bin/ffmpeg.exe")
+        validate_zip_member("plain.txt")
+
+    def test_parent_traversal_rejected(self) -> None:
+        with pytest.raises(BinaryDownloadError):
+            validate_zip_member("../evil.exe")
+        with pytest.raises(BinaryDownloadError):
+            validate_zip_member("a/../../evil.exe")
+
+    def test_absolute_paths_rejected(self) -> None:
+        with pytest.raises(BinaryDownloadError):
+            validate_zip_member("C:/Windows/evil.exe")
+        with pytest.raises(BinaryDownloadError):
+            validate_zip_member("/abs/evil.exe")
+
+    def test_safe_extract_zip(self, tmp_path: Path) -> None:
+        archive = tmp_path / "tools.zip"
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr("ffmpeg-7/bin/ffmpeg.exe", b"MZ fake")
+            zf.writestr("ffmpeg-7/bin/ffprobe.exe", b"MZ fake")
+            zf.writestr("readme.txt", b"hello")
+        dest = tmp_path / "extracted"
+        extracted = safe_extract_zip(archive, dest)
+        assert (dest / "ffmpeg-7" / "bin" / "ffmpeg.exe").read_bytes() == b"MZ fake"
+        assert len(extracted) == 3
+
+    def test_safe_extract_rejects_zip_slip(self, tmp_path: Path) -> None:
+        archive = tmp_path / "evil.zip"
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr("../evil.exe", b"bad")
+        with pytest.raises(BinaryDownloadError):
+            safe_extract_zip(archive, tmp_path / "out")
+
+    def test_collect_executables_flattens(self, tmp_path: Path) -> None:
+        nested = tmp_path / "x" / "bin"
+        nested.mkdir(parents=True)
+        (nested / "ffmpeg.exe").write_bytes(b"a")
+        (nested / "ffprobe.exe").write_bytes(b"b")
+        (nested / "unrelated.exe").write_bytes(b"c")
+        found = collect_executables(tmp_path, ["ffmpeg", "ffprobe"])
+        assert set(found) == {"ffmpeg", "ffprobe"}
+        assert found["ffmpeg"].name == "ffmpeg.exe"
+
+
+# ---------------------------------------------------------------------------
+# MKVToolNix release listing parsing
+# ---------------------------------------------------------------------------
+
+
+class TestMkvToolNixListing:
+    # Real-world autoindex format (as of mkvtoolnix.download): "./99.0/" style hrefs.
+    LISTING = """
+    <a href="./82.0/">82.0/</a>
+    <a href="./84.0/">84.0/</a>
+    <a href="./83.0.1/">83.0.1/</a>
+    <a href="86.0/">86.0/</a>
+    <a href="./notes/">notes/</a>
+    """
+
+    def test_versions_sorted_newest_first(self) -> None:
+        versions = parse_mkvtoolnix_versions(self.LISTING)
+        assert versions[0] == "86.0"
+        assert versions == sorted(versions, key=lambda v: [int(p) for p in v.split(".")], reverse=True)
+
+    def test_relative_hrefs_also_matched(self) -> None:
+        versions = parse_mkvtoolnix_versions('<a href="12.0/">12.0/</a><a href="/windows/releases/13.0/">')
+        assert "12.0" in versions and "13.0" in versions
+
+    def test_archive_preference(self) -> None:
+        listing = (
+            '<a href="./mkvtoolnix-32-bit-84.0.7z">32</a>'
+            '<a href="./mkvtoolnix-64-bit-84.0.7z">7z</a>'
+            '<a href="mkvtoolnix-64-bit-84.0.zip">zip</a>'
+            '<a href="./mkvtoolnix-64-bit-gui-84.0.7z">gui</a>'
+        )
+        assert choose_mkvtoolnix_archive(listing) == "mkvtoolnix-64-bit-84.0.zip"
+
+    def test_real_world_7z_only_listing(self) -> None:
+        listing = (
+            '<a href="./mkvtoolnix-64-bit-90.0-setup.exe">setup</a>'
+            '<a href="./mkvtoolnix-64-bit-90.0.7z">7z</a>'
+        )
+        assert choose_mkvtoolnix_archive(listing) == "mkvtoolnix-64-bit-90.0.7z"
+
+    def test_no_archives(self) -> None:
+        assert choose_mkvtoolnix_archive("<a href='./82.0/'>x</a>") is None
+
+
+# ---------------------------------------------------------------------------
+# Tool locator
+# ---------------------------------------------------------------------------
+
+
+class TestLocateTool:
+    def test_prefers_local_bin(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "ffmpeg.exe").write_bytes(b"MZ")
+        monkeypatch.setattr("episodematch.core.binaries.probe_version", lambda *_a, **_k: "7.0")
+        info = locate_tool("ffmpeg", bin_dir=bin_dir)
+        assert info.is_available
+        assert info.source.value == "local_bin"
+        assert info.version == "7.0"
+
+    def test_not_found(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("shutil.which", lambda name: None)
+        info = locate_tool("mkvmerge", bin_dir=tmp_path / "empty")
+        assert not info.is_available
+        assert info.source.value == "not_found"
+
+    def test_system_path_fallback(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake = tmp_path / "elsewhere"
+        fake.mkdir()
+        (fake / "ffmpeg.exe").write_bytes(b"MZ")
+        monkeypatch.setattr("shutil.which", lambda name: str(fake / "ffmpeg.exe") if name == "ffmpeg" else None)
+        monkeypatch.setattr("episodematch.core.binaries.probe_version", lambda *_a, **_k: "6.9")
+        info = locate_tool("ffmpeg", bin_dir=tmp_path / "bin")
+        assert info.source.value == "system_path"
+
+    def test_resolver_caches_and_invalidates(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("shutil.which", lambda name: None)
+        resolver = ToolResolver(tmp_path / "bin", probe=False)
+        assert resolver.find("ffmpeg").is_available is False
+        (tmp_path / "bin").mkdir()
+        (tmp_path / "bin" / "ffmpeg.exe").write_bytes(b"MZ")
+        assert resolver.find("ffmpeg").is_available is False  # cached
+        resolver.invalidate()
+        assert resolver.find("ffmpeg").is_available is True
+
+    def test_seconv_in_tool_status_via_subtitle_edit_folder(self, tmp_path: Path) -> None:
+        """seconv may live in bin/SubtitleEdit/ — locate_all_tools must find it
+        there (it powers the PGS fast path and shows in Settings)."""
+        from episodematch.core.binaries import locate_all_tools
+
+        se_dir = tmp_path / "bin" / "SubtitleEdit"
+        se_dir.mkdir(parents=True)
+        (se_dir / "seconv.exe").write_bytes(b"MZ")
+        status = locate_all_tools(bin_dir=tmp_path / "bin", probe=False)
+        info = status.get("seconv")
+        assert info.is_available and info.path == se_dir / "seconv.exe"
+        assert info.source.value == "local_bin"
+
+    def test_seconv_missing_reports_not_found(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("shutil.which", lambda name: None)
+        from episodematch.core.binaries import locate_all_tools
+
+        status = locate_all_tools(bin_dir=tmp_path / "bin", probe=False)
+        assert not status.get("seconv").is_available
+
+    def test_require_tool_raises_with_hint(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("shutil.which", lambda name: None)
+        resolver = ToolResolver(tmp_path / "bin", probe=False)
+        with pytest.raises(BinaryNotFoundError) as excinfo:
+            resolver.tool_path("ffprobe")
+        assert "fetch-tools" in str(excinfo.value)
+
+
+class TestVersionProbe:
+    def test_parses_ffmpeg_version(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        exe = tmp_path / "ffmpeg.exe"
+        exe.write_bytes(b"MZ")
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda *a, **k: subprocess.CompletedProcess(a[0], 0, stdout="ffmpeg version 7.0.2 Copyright\nbuilt with gcc", stderr=""),
+        )
+        assert probe_version(exe) == "7.0.2"
+
+    def test_parses_mkvmerge_version(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        exe = tmp_path / "mkvmerge.exe"
+        exe.write_bytes(b"MZ")
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda *a, **k: subprocess.CompletedProcess(a[0], 0, stdout="mkvmerge v84.0 ('Name') 64-bit", stderr=""),
+        )
+        assert probe_version(exe) == "84.0"
+
+    def test_unrunnable_binary_returns_none(self, tmp_path: Path) -> None:
+        assert probe_version(tmp_path / "does_not_exist.exe") is None
+
+
+# ---------------------------------------------------------------------------
+# Downloader end-to-end with a mocked transport
+# ---------------------------------------------------------------------------
+
+
+def _zip_bytes(members: dict[str, bytes]) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as zf:
+        for name, data in members.items():
+            zf.writestr(name, data)
+    return buffer.getvalue()
+
+
+class TestBinaryDownloaderMocked:
+    @pytest.fixture(autouse=True)
+    def _tiny_archive_threshold(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Test archives are tiny; relax the real-world 1 MiB sanity threshold.
+        monkeypatch.setattr("episodematch.core.bin_downloader._MIN_ARCHIVE_BYTES", 64)
+
+    def test_fetch_ffmpeg_installs_and_verifies(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        archive = _zip_bytes(
+            {
+                "ffmpeg-7.0-essentials_build/bin/ffmpeg.exe": b"MZ ffmpeg",
+                "ffmpeg-7.0-essentials_build/bin/ffprobe.exe": b"MZ ffprobe",
+            }
+        )
+        requests: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(str(request.url))
+            return httpx.Response(200, content=archive, headers={"content-length": str(len(archive))})
+
+        transport = httpx.MockTransport(handler)
+        monkeypatch.setattr("episodematch.core.bin_downloader.probe_version", lambda path, **k: "7.0")
+        downloader = BinaryDownloader(tmp_path / "bin", client=httpx.Client(transport=transport))
+        result = downloader.fetch_ffmpeg()
+        assert set(result) == {"ffmpeg", "ffprobe"}
+        assert (tmp_path / "bin" / "ffmpeg.exe").is_file()
+        assert (tmp_path / "bin" / "ffprobe.exe").is_file()
+
+    def test_progress_callback_called(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        archive = _zip_bytes({"build/bin/ffmpeg.exe": b"MZ ffmpeg"})
+        transport = httpx.MockTransport(lambda request: httpx.Response(200, content=archive, headers={"content-length": str(len(archive))}))
+        monkeypatch.setattr("episodematch.core.bin_downloader.probe_version", lambda path, **k: "7.0")
+        progress_events: list[tuple[str, int, int | None]] = []
+        downloader = BinaryDownloader(tmp_path / "bin", client=httpx.Client(transport=transport))
+        downloader.fetch_ffmpeg(progress=lambda label, done, total: progress_events.append((label, done, total)))
+        # Streaming progress must report at least the full archive size at some point.
+        assert any(done >= len(archive) for _label, done, _total in progress_events)
+
+    def test_http_error_raises_binary_download_error(self, tmp_path: Path) -> None:
+        transport = httpx.MockTransport(lambda request: httpx.Response(404, content=b"nope"))
+        downloader = BinaryDownloader(tmp_path / "bin", client=httpx.Client(transport=transport))
+        with pytest.raises(BinaryDownloadError):
+            downloader.fetch_ffmpeg()
+
+    def test_cancel_stops_download(self, tmp_path: Path) -> None:
+        archive = _zip_bytes({"build/bin/ffmpeg.exe": b"MZ" * 1000})
+        transport = httpx.MockTransport(lambda request: httpx.Response(200, content=archive, headers={"content-length": str(len(archive))}))
+        downloader = BinaryDownloader(tmp_path / "bin", client=httpx.Client(transport=transport))
+        with pytest.raises(BinaryDownloadError) as excinfo:
+            downloader.fetch_ffmpeg(cancel=lambda: True)
+        assert "cancelled" in str(excinfo.value)
+
+    def test_mkvtoolnix_candidates_include_pinned_fallback(self, tmp_path: Path) -> None:
+        transport = httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                content=b'<a href="84.0/">84.0/</a>',
+                headers={"content-type": "text/html"},
+            )
+        )
+        downloader = BinaryDownloader(tmp_path / "bin", client=httpx.Client(transport=transport))
+        candidates = downloader._mkvtoolnix_candidates()
+        assert candidates, "expected at least the pinned fallback"
+        assert "mkvtoolnix-64-bit" in candidates[0]
+        assert candidates[-1].endswith(".zip")
+
+    def test_fetch_seconv_installs_into_bin(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """SeConv ships as a standalone Windows asset on the SubtitleEdit release —
+        the downloader must install it into ./bin/ (PGS fast path)."""
+        archive = _zip_bytes({"seconv.exe": b"MZ seconv"})
+        transport = httpx.MockTransport(
+            lambda request: httpx.Response(200, content=archive, headers={"content-length": str(len(archive))})
+        )
+        monkeypatch.setattr("episodematch.core.bin_downloader.probe_version", lambda path, **k: "5.4.0")
+        downloader = BinaryDownloader(tmp_path / "bin", client=httpx.Client(transport=transport))
+        installed = downloader.fetch_seconv()
+        assert installed == ["seconv"]
+        assert (tmp_path / "bin" / "seconv.exe").is_file()
+
+    def test_download_missing_includes_seconv(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """download_missing must treat a missing seconv like any other missing tool."""
+        from episodematch.core.bin_downloader import BinaryDownloader, DownloadResult
+
+        archive = _zip_bytes({"seconv.exe": b"MZ seconv"})
+        transport = httpx.MockTransport(
+            lambda request: httpx.Response(200, content=archive, headers={"content-length": str(len(archive))})
+        )
+        monkeypatch.setattr("episodematch.core.bin_downloader.probe_version", lambda path, **k: "5.4.0")
+
+        # ffmpeg/mkvtoolnix present, only seconv missing:
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        for name in ("ffmpeg", "ffprobe", "mkvmerge", "mkvextract", "mkvpropedit"):
+            (bin_dir / f"{name}.exe").write_bytes(b"MZ")
+
+        downloader = BinaryDownloader(bin_dir, client=httpx.Client(transport=transport))
+        result: DownloadResult = downloader.download_missing()
+        assert "seconv" in result.installed
+        assert "ffmpeg" in result.skipped  # present -> not re-downloaded
+        assert (bin_dir / "seconv.exe").is_file()
+
+
+# ---------------------------------------------------------------------------
+# Config: env overrides + persistence
+# ---------------------------------------------------------------------------
+
+
+class TestConfig:
+    def test_env_overrides_llm_fields(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("EPISODEMATCH_LLM_API_KEY", "sk-test")
+        monkeypatch.setenv("EPISODEMATCH_LLM_BASE_URL", "https://api.example.com/v4/")
+        monkeypatch.setenv("EPISODEMATCH_LLM_MODEL", "glm-4.5-air")
+        monkeypatch.setenv("EPISODEMATCH_TMDB_API_KEY", "tmdb123")
+        config = apply_env_overrides(AppConfig())
+        assert config.llm_api_key == "sk-test"
+        assert config.llm_base_url == "https://api.example.com/v4"
+        assert config.llm_model == "glm-4.5-air"
+        assert config.tmdb_api_key == "tmdb123"
+
+    def test_defaults(self) -> None:
+        config = AppConfig()
+        assert config.llm_base_url == "https://open.bigmodel.cn/api/paas/v4"
+        assert config.llm_model == "glm-4-flash"
+        assert config.naming.episode_template.startswith("{series}/Season")
+
+    def test_invalid_llm_url_rejected(self) -> None:
+        import pydantic
+
+        with pytest.raises(pydantic.ValidationError):
+            AppConfig(llm_base_url="not-a-url")
+
+    def test_store_roundtrip(self, tmp_path: Path) -> None:
+        from episodematch.core.config import ConfigStore
+
+        path = tmp_path / "data" / "config.json"
+        store = ConfigStore(path)
+        config = AppConfig(tmdb_api_key="abc123", av1_preset=8)
+        written = store.save(config)
+        assert written == path
+        loaded = store.load()
+        assert loaded.tmdb_api_key == "abc123"
+        assert loaded.av1_preset == 8
+
+    def test_store_invalid_json_raises(self, tmp_path: Path) -> None:
+        from episodematch.core.config import ConfigStore
+
+        path = tmp_path / "config.json"
+        path.write_text("{broken", encoding="utf-8")
+        with pytest.raises(ConfigError):
+            ConfigStore(path).load()
+
+    def test_masked_keys(self) -> None:
+        config = AppConfig(tmdb_api_key="abcdefghijk")
+        masked = config.masked()
+        assert "abcdefghijk" not in masked["tmdb_api_key"]
+        assert masked["llm_api_key"] == ""
+
+
+class TestPathResolution:
+    def test_find_project_root_finds_checkout(self) -> None:
+        from episodematch.core.config import find_project_root
+
+        root = find_project_root(Path("src") / "episodematch" / "core" / "config.py")
+        assert root is not None and (root / "pyproject.toml").is_file()
+
+    def test_dev_anchor_outranks_cwd(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Development (venv/checkout): the project root's bin/data win even when
+        the current directory contains same-named folders — accidental CWDs must
+        not fork configuration and caches."""
+        from episodematch.core.config import AppConfig, find_project_root
+
+        (tmp_path / "bin").mkdir()
+        monkeypatch.chdir(tmp_path)
+        root = find_project_root()
+        assert root is not None
+        resolved = AppConfig().resolve_path("bin")
+        assert resolved == root / "bin"
+
+    def test_frozen_exe_keeps_cwd_relative(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Packaged dist layout: the copied folder's own bin/data win — the
+        frozen build must never hijack the developer checkout."""
+        import sys
+
+        from episodematch.core.config import AppConfig
+
+        (tmp_path / "bin").mkdir()
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+        resolved = AppConfig().resolve_path("bin")
+        assert resolved == tmp_path / "bin"
+
+    def test_frozen_exe_missing_dir_stays_cwd(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        import sys
+
+        from episodematch.core.config import AppConfig
+
+        monkeypatch.chdir(tmp_path)  # no bin/ here at all
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+        assert AppConfig().resolve_path("bin") == tmp_path / "bin"
+
+    def test_resolve_path_falls_back_to_project_root(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Started from a foreign CWD (double-clicked shim), bin/data resolve to
+        the checkout instead of being created in the wrong place."""
+        from episodematch.core.config import AppConfig, find_project_root
+
+        monkeypatch.chdir(tmp_path)  # tmp has no bin/
+        config = AppConfig()
+        root = find_project_root()
+        assert root is not None
+        assert config.resolve_path("bin") == root / "bin"
+        assert config.resolved_bin_dir == root / "bin"
+        assert config.database_path == root / "data" / "episodematch.db"
+
+    def test_config_store_default_follows_root_fallback(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from episodematch.core.config import ConfigStore, find_project_root
+
+        monkeypatch.chdir(tmp_path)
+        root = find_project_root()
+        assert root is not None
+        assert ConfigStore().path == root / "data" / "config.json"
+        # ... unless an explicit path is given (tests use this constantly)
+        assert ConfigStore(tmp_path / "custom.json").path == tmp_path / "custom.json"
+
+    def test_absolute_paths_pass_through(self) -> None:
+        from episodematch.core.config import AppConfig
+
+        assert AppConfig().resolve_path(Path("X:/anywhere/bin")) == Path("X:/anywhere/bin")
+
+
+class TestCacheDatabase:
+    def test_json_cache_roundtrip_with_ttl(self, tmp_path: Path) -> None:
+        with CacheDatabase(tmp_path / "test.db") as db:
+            db.put_json("key", {"a": 1}, ttl_seconds=60)
+            assert db.get_json("key") == {"a": 1}
+            db.put_json("key", {"a": 2}, ttl_seconds=-1)  # already expired
+            assert db.get_json("key") is None
+
+    def test_model_cache(self, tmp_path: Path) -> None:
+        from episodematch.core.models import ToolInfo
+
+        with CacheDatabase(tmp_path / "test.db") as db:
+            db.put_model("tool", ToolInfo(name="ffmpeg", version="7"))
+            loaded = db.get_model("tool", ToolInfo)
+            assert loaded is not None and loaded.version == "7"
+
+    def test_scan_cache(self, tmp_path: Path) -> None:
+        with CacheDatabase(tmp_path / "test.db") as db:
+            db.put_mkv_scan(Path("x.mkv"), 100, 1.0, {"duration": 5.0})
+            assert db.get_mkv_scan(Path("x.mkv"), 100, 1.0) == {"duration": 5.0}
+            assert db.get_mkv_scan(Path("x.mkv"), 101, 1.0) is None
+
+    def test_disc_cache_search(self, tmp_path: Path) -> None:
+        with CacheDatabase(tmp_path / "test.db") as db:
+            db.put_disc("k1", "Breaking Bad", {"upc": "1"})
+            hits = db.find_discs_by_series("breaking")
+            assert hits == [{"upc": "1"}]
+
+    def test_purge_expired(self, tmp_path: Path) -> None:
+        with CacheDatabase(tmp_path / "test.db") as db:
+            db.put_json("gone", [1], ttl_seconds=-10)
+            db.put_json("stay", [2], ttl_seconds=60)
+            assert db.purge_expired() == 1
+            assert db.get_json("stay") == [2]
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+class TestCli:
+    def test_version_command(self, capsys: pytest.CaptureFixture) -> None:
+        assert main(["version"]) == 0
+        assert "EpisodeMatch" in capsys.readouterr().out
+
+    def test_check_env_runs_without_tools(self, config: AppConfig, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("episodematch.main.ConfigStore.load", lambda self: config)
+        monkeypatch.setattr("shutil.which", lambda name: None)
+        # Force the "no OCR backend" branch even on machines with real OCR installed.
+        monkeypatch.setattr("episodematch.extractors.ocr_engine._BACKEND_FACTORIES", ())
+        assert main(["check-env"]) == 0
+        output = capsys.readouterr().out
+        assert "ffmpeg" in output and "not found" in output
+        # With the backend factories cleared, the OCR line must show unavailable.
+        assert "✗ ocr" in output
+
+    def test_match_missing_folder_errors(self, config: AppConfig, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("episodematch.main.ConfigStore.load", lambda self: config)
+        assert main(["match", str(config.resolved_data_dir / "nope"), "--series", "X", "--season", "1"]) == 1
+
+    def test_match_folder_without_mkvs_errors(self, config: AppConfig, tmp_path: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("episodematch.main.ConfigStore.load", lambda self: config)
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        assert main(["match", str(empty), "--series", "X", "--season", "1"]) == 1
+
+    def test_json_report_shape(self, config: AppConfig, tmp_path: Path, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch) -> None:
+        """End-to-end: probe-less fast scan is impossible without tools -> the CLI
+        must exit cleanly with an error message (JSON mode still exits 1)."""
+        monkeypatch.setattr("episodematch.main.ConfigStore.load", lambda self: config)
+        folder = tmp_path / "rips"
+        folder.mkdir()
+        (folder / "title_t00.mkv").write_bytes(b"\x1a\x45\xdf\xa3" + b"\x00" * 64)
+        code = main(["match", str(folder), "--series", "X", "--season", "1", "--json", "--no-discdb"])
+        assert code == 1  # ffprobe missing -> clean failure, no traceback
