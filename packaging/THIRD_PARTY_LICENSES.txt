@@ -1,0 +1,55 @@
+EpisodeMatch v0.1.0 — THIRD-PARTY LICENSES & ATTRIBUTIONS
+=========================================================
+
+This archive contains redistributions of third-party software. This file
+summarizes what is bundled, under which license, and where to obtain the
+corresponding source code. Full license texts are included where required
+(see the LICENSES/ folder in this archive and the `*.dist-info` folders
+inside `_internal/`).
+
+IMPORTANT — GPL COMPONENTS ARE NOT PART OF THIS ARCHIVE
+-------------------------------------------------------
+The external tools ffmpeg.exe, ffprobe.exe, mkvmerge.exe, mkvextract.exe,
+mkvpropedit.exe (GPL) and seconv.exe (GPL, part of SubtitleEdit) are NOT
+included in this archive and are NOT distributed by EpisodeMatch. On first
+run, the built-in downloader fetches them locally on YOUR machine directly
+from their original distribution servers (gyan.dev, mkvtoolnix.download,
+github.com/SubtitleEdit). You are the downloader of those binaries; please
+observe the respective licenses (GPLv2/GPLv3). Their complete source code is
+available from the projects' official repositories.
+
+DYNAMICALLY LINKED LGPL COMPONENTS
+----------------------------------
+* PySide6 (Qt for Python) + shiboken6 — LGPL-3.0-only
+  https://code.qt.io/cgit/pyside/pyside-setup.git/
+  Qt is dynamically linked and delivered as separate files (Qt6*.dll inside
+  _internal/PySide6/), NOT statically merged into the executables. You may
+  relink/replace these components and run the application with your own
+  modified Qt build. The complete LGPL-3.0 license text is provided in
+  LICENSES/LGPL-3.0-only.txt in this archive, and the corresponding source
+  code of PySide6/shiboken6 is available at the URL above.
+
+OTHER BUNDLED COMPONENTS
+------------------------
+* CPython (python312.dll) — PSF License Version 2 — https://www.python.org/
+* PyInstaller bootloader — GPL-2.0-or-later WITH the PyInstaller Bootloader
+  Exception (executables produced by PyInstaller may be distributed without
+  the bootloader source) — https://pyinstaller.org/
+* scipy — BSD-3-Clause — https://scipy.org/
+* numpy — BSD-3-Clause — https://numpy.org/
+* Pillow — MIT-CMU — https://python-pillow.org/
+* rapidfuzz — MIT — https://github.com/rapidfuzz/RapidFuzz
+* pydantic / pydantic-core — MIT — https://docs.pydantic.dev/
+* httpx, httpcore, anyio, h11, certifi — BSD-3-Clause / Apache-2.0 / MPL-2.0
+  (certifi: Mozilla Public License 2.0)
+* beautifulsoup4, soupsieve — MIT — https://www.crummy.com/software/BeautifulSoup/
+* pluggy — MIT — https://github.com/pytest-dev/pluggy
+
+Complete license texts of the Python packages are included in their
+`*.dist-info` folders inside `_internal/` where the packages provide them.
+
+EPISODEMATCH ITSELF
+-------------------
+EpisodeMatch source code (src/, tests/, scripts/, packaging/) is licensed
+under the MIT License — see LICENSE in the repository:
+https://github.com/escaton80/EpisodeMatch
