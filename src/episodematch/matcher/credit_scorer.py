@@ -162,7 +162,12 @@ def _normalize_title(text: str) -> str:
 
 
 def credit_evidence(hits: list[TitleCardHit], score: CreditScore) -> list[Evidence]:
-    """Build user-facing evidence entries from a credit score."""
+    """Build user-facing evidence entries from a credit score.
+
+    Per-hit items are display-only (``episode_hint`` stays unset) — the
+    calibrated contribution to the assignment comes from the summary evidence,
+    so the aggregation never double-counts one observation (audit A4a).
+    """
     evidence: list[Evidence] = []
     for match in score.matches:
         hit = _find_hit_for_name(hits, match.ocr_name)
@@ -182,7 +187,6 @@ def credit_evidence(hits: list[TitleCardHit], score: CreditScore) -> list[Eviden
                     "ratio": match.ratio,
                 },
                 timestamp_seconds=hit.timestamp_seconds if hit else None,
-                episode_hint=score.episode_number,
             )
         )
     return evidence

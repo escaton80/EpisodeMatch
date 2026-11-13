@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt
@@ -163,10 +164,24 @@ class FluentWindow(QMainWindow):
         super().showEvent(event)
         apply_windows11_chrome(self)
 
+    def _views_busy(self) -> bool:
+        """True while any view still runs a worker thread (audit D2)."""
+        return any(
+            getattr(view, "is_busy", lambda: False)()  # noqa: B008 - default probe
+            for view in self._views.values()
+        )
+
     def closeEvent(self, event) -> None:  # noqa: ANN001, N802 - Qt override
         for view in self._views.values():
             if hasattr(view, "shutdown"):
                 view.shutdown()
+        if self._views_busy():
+            # Audit D2: never close the shared database under live workers —
+            # let the user wait (recommended) or explicitly accept the risk.
+            if _confirm_close_while_busy(self) == "wait":
+                while self._views_busy():
+                    QApplication.processEvents()
+                    time.sleep(0.05)
         if self._context.database is not None:
             self._context.database.close()
         super().closeEvent(event)
@@ -199,4 +214,26 @@ def run_gui(
     return 0 if smoke else exit_code
 
 
-__all__ = ["FluentWindow", "create_app_context", "run_gui"]
+def _confirm_close_while_busy(parent) -> str:  # noqa: ANN001 - QWidget
+    """Ask whether to wait for running background tasks or close anyway.
+
+    Returns ``"wait"`` (default) or ``"close"`` — module-level so tests can
+    stub the decision.
+    """
+    from PySide6.QtWidgets import QMessageBox
+
+    box = QMessageBox(parent)
+    box.setWindowTitle("Background tasks running")
+    box.setIcon(QMessageBox.Icon.Warning)
+    box.setText(
+        "Background tasks are still running.\n\n"
+        "Wait until they finish (recommended), or close anyway?"
+    )
+    wait_button = box.addButton("Wait for tasks", QMessageBox.ButtonRole.AcceptRole)
+    close_button = box.addButton("Close anyway", QMessageBox.ButtonRole.DestructiveRole)
+    box.setDefaultButton(wait_button)
+    box.exec()
+    return "close" if box.clickedButton() is close_button else "wait"
+
+
+__all__ = ["FluentWindow", "create_app_context", "run_gui", "_confirm_close_while_busy"]

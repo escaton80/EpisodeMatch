@@ -255,7 +255,7 @@ def _cmd_match(args: argparse.Namespace) -> int:
 
 
 def _apply_renames(config: AppConfig, report: ScanReport, *, as_json: bool) -> int | None:
-    from episodematch.postprocess.renamer import Renamer, build_rename_plan
+    from episodematch.postprocess.renamer import Renamer, build_rename_plan, repoint_entries
 
     template = config.naming.episode_template
     plan = build_rename_plan(
@@ -275,6 +275,11 @@ def _apply_renames(config: AppConfig, report: ScanReport, *, as_json: bool) -> i
         return 1
     for item in applied:
         print(f"  renamed: {item.file_name} -> {item.destination}")
+    # Audit B4: entries must follow the renames, or a subsequent --tag pass
+    # writes mkvpropedit titles against paths that no longer exist.
+    repointed = repoint_entries(report.assignment.entries, applied)
+    if repointed:
+        print(f"  updated {repointed} entry path(s) for post-rename steps")
     return None
 
 

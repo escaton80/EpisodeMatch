@@ -661,22 +661,42 @@ class PgsSupParser:
         self._default_event_duration = default_event_duration
         self._reset()
 
-    def _reset(self) -> None:
+    def _reset(self, pts_windows: Sequence[tuple[float, float]] | None = None) -> None:
         self._palettes: dict[int, Palette] = {}
         self._ods = _OdsAssembler()
         self._assembled_store: dict[int, ObjectDefinition] = {}
         self._events: list[PgsEvent] = []
         self._boundaries: list[float] = []
+        # Audit C4: when a time window is given, display sets outside it are
+        # folded (objects/palettes still cached) but NOT RLE-decoded.
+        self._pts_windows = list(pts_windows) if pts_windows else None
 
     # -- public API -------------------------------------------------------------
 
-    def parse_file(self, path: Path | str) -> list[PgsEvent]:
+    def parse_file(
+        self,
+        path: Path | str,
+        *,
+        pts_windows: Sequence[tuple[float, float]] | None = None,
+    ) -> list[PgsEvent]:
         data = Path(path).read_bytes()
-        return self.parse_sup(data)
+        return self.parse_sup(data, pts_windows=pts_windows)
 
-    def parse_sup(self, data: bytes | bytearray) -> list[PgsEvent]:
-        """Parse a full ``.sup`` byte stream."""
-        self._reset()
+    def parse_sup(
+        self,
+        data: bytes | bytearray,
+        *,
+        pts_windows: Sequence[tuple[float, float]] | None = None,
+    ) -> list[PgsEvent]:
+        """Parse a full ``.sup`` byte stream.
+
+        ``pts_windows`` (list of ``(start, end)`` second ranges) restricts which
+        display sets are RLE-decoded into events — sets outside every window
+        only contribute timing boundaries. Objects and palettes from sets
+        outside the window are still cached, so in-window events that reuse
+        them keep working.
+        """
+        self._reset(pts_windows)
         pending: list[Segment] = []
         for segment in iter_sup_segments(data):
             if segment.type_code == SegmentType.END:
@@ -693,20 +713,26 @@ class PgsSupParser:
         if pending:
             self._consume_display_set(pending)
         events = self._events
-        refine_event_timing(events, boundaries=self._boundaries)
+        refine_event_timing(events, boundaries=self._boundaries, default_event_duration=self._default_event_duration)
         self._reset()
         return events
 
-    def parse_raw(self, data: bytes | bytearray, *, pts_seconds: float | None = None) -> list[PgsEvent]:
+    def parse_raw(
+        self,
+        data: bytes | bytearray,
+        *,
+        pts_seconds: float | None = None,
+        pts_windows: Sequence[tuple[float, float]] | None = None,
+    ) -> list[PgsEvent]:
         """Parse raw Matroska-style segments; ``pts_seconds`` seeds all segment PTS values."""
-        self._reset()
+        self._reset(pts_windows)
         pending: list[Segment] = []
         for raw in iter_raw_segments(data):
             pending.append(Segment(type=raw.type, pts_seconds=pts_seconds, payload=raw.payload))
         if pending:
             self._consume_display_set(pending)
         events = self._events
-        refine_event_timing(events, boundaries=self._boundaries)
+        refine_event_timing(events, boundaries=self._boundaries, default_event_duration=self._default_event_duration)
         self._reset()
         return events
 
@@ -717,7 +743,9 @@ class PgsSupParser:
         if not segments:
             return
         self._ods.reset()
-        self._assembled_store = {}
+        # Audit C1: assembled objects persist for the whole epoch (a normal-case
+        # PCS may reference an object defined in an earlier display set), so the
+        # store is NOT cleared per display set — only on EPOCH_START/reset.
         pcs: Pcs | None = None
         pcs_pts: float | None = None
         for segment in segments:
@@ -727,13 +755,22 @@ class PgsSupParser:
                     pcs = parse_pcs(segment.payload)
                     pcs_pts = segment.pts_seconds
                     if pcs.composition_state == CompositionState.EPOCH_START:
-                        # New epoch: palettes from the previous epoch are invalidated.
+                        # New epoch: palettes and objects from the previous epoch
+                        # are invalidated (objects are re-sent by this set).
                         self._palettes.clear()
+                        self._assembled_store.clear()
                 elif code == SegmentType.WDS:
                     parse_wds(segment.payload)  # validated for structure; placements come from PCS
                 elif code == SegmentType.PDS:
                     palette = parse_pds(segment.payload)
-                    self._palettes[palette.palette_id] = palette
+                    existing = self._palettes.get(palette.palette_id)
+                    if existing is not None:
+                        # Audit C2: real streams send partial palette updates —
+                        # merge per color id instead of wiping the old palette.
+                        existing.version = palette.version
+                        existing.entries.update(palette.entries)
+                    else:
+                        self._palettes[palette.palette_id] = palette
                 elif code == SegmentType.ODS:
                     for obj in self._ods.feed(segment.payload):
                         self._assembled_store[obj.object_id] = obj
@@ -756,6 +793,13 @@ class PgsSupParser:
         self._boundaries.append(pcs_pts)
         if not self._assembled_store or not pcs.objects:
             # Clearing/empty display set: contributes a timing boundary only.
+            return
+
+        if self._pts_windows is not None and not any(
+            lo <= pcs_pts <= hi for lo, hi in self._pts_windows
+        ):
+            # Audit C4: out-of-window display set — cache state only, skip the
+            # expensive RLE decode (the event is not scanned anyway).
             return
 
         start = pcs_pts
@@ -798,8 +842,18 @@ class PgsSupParser:
         self._events.append(event)
 
 
-def refine_event_timing(events: list[PgsEvent], *, boundaries: Sequence[float]) -> None:
-    """Clamp each event's end time to the next PCS boundary (clearing or next event)."""
+def refine_event_timing(
+    events: list[PgsEvent],
+    *,
+    boundaries: Sequence[float],
+    default_event_duration: float = 2.0,
+) -> None:
+    """Clamp each event's end time to the next PCS boundary (clearing or next event).
+
+    Audit C3: an event with no later boundary (stream ends with a visible
+    display set) keeps the ``default_event_duration`` instead of collapsing to
+    zero length.
+    """
     ordered = sorted(set(boundaries))
     for index, event in enumerate(events):
         candidates = [b for b in ordered if b > event.start_seconds + 1e-6]
@@ -807,13 +861,32 @@ def refine_event_timing(events: list[PgsEvent], *, boundaries: Sequence[float]) 
             event_end = candidates[0]
         else:
             following = [e.start_seconds for e in events[index + 1 :] if e.start_seconds > event.start_seconds + 1e-6]
-            event_end = min(following) if following else event.start_seconds
-        event.end_seconds = event_end if event_end > event.start_seconds else event.start_seconds
+            event_end = min(following) if following else event.start_seconds + default_event_duration
+        event.end_seconds = event_end if event_end > event.start_seconds else event.start_seconds + default_event_duration
 
 
-def parse_sup_events(data: bytes | bytearray, *, default_event_duration: float = 2.0) -> list[PgsEvent]:
+def parse_sup_events(
+    data: bytes | bytearray,
+    *,
+    default_event_duration: float = 2.0,
+    pts_windows: Sequence[tuple[float, float]] | None = None,
+) -> list[PgsEvent]:
     """Convenience wrapper: parse a ``.sup`` stream in one call."""
-    return PgsSupParser(default_event_duration=default_event_duration).parse_sup(data)
+    return PgsSupParser(default_event_duration=default_event_duration).parse_sup(data, pts_windows=pts_windows)
+
+
+def compute_window_ranges(duration_seconds: float | None, window_minutes: float) -> list[tuple[float, float]]:
+    """Absolute second ranges of the first/last ``window_minutes`` scan windows.
+
+    Mirrors :func:`filter_events_window`; a short track merges into one range.
+    Returns ``[]`` when ``duration_seconds`` is unknown — i.e. "no restriction".
+    """
+    if duration_seconds is None or duration_seconds <= 0:
+        return []
+    window = window_minutes * 60.0
+    if duration_seconds <= 2 * window:
+        return [(0.0, duration_seconds)]
+    return [(0.0, window), (duration_seconds - window, duration_seconds)]
 
 
 # ---------------------------------------------------------------------------

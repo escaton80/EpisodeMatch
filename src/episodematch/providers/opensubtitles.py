@@ -210,7 +210,15 @@ class OpenSubtitlesClient:
                     provider="opensubtitles",
                     status_code=response.status_code,
                 )
-            return response.json()
+            try:
+                return response.json()
+            except ValueError as exc:
+                # Audit B6: a 200 with an HTML/empty body (CDN wall) must not
+                # escape as a raw JSONDecodeError.
+                raise ProviderError(
+                    f"OpenSubtitles returned a 200 response that is not JSON: {response.text[:200]!r}",
+                    provider="opensubtitles",
+                ) from exc
 
     # -- search + download ---------------------------------------------------------------
 
@@ -309,14 +317,7 @@ class OpenSubtitlesClient:
         """
         requested = (languages or "en").lower()
         requested_set = {part.strip().lower()[:2] for part in requested.split(",") if part.strip()}
-        if self._quota_blocked_until > time.time():
-            logger.debug(
-                "Skipping OpenSubtitles download for S%02dE%02d — daily quota exhausted until %s",
-                season,
-                episode,
-                time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(self._quota_blocked_until)),
-            )
-            return None
+        quota_blocked = self._quota_blocked_until > time.time()
         results = self.search_episode_subtitles(
             tmdb_id=tmdb_id,
             imdb_id=imdb_id,
@@ -328,6 +329,36 @@ class OpenSubtitlesClient:
             logger.info("OpenSubtitles search returned 0 entries for S%02dE%02d (%s)", season, episode, requested)
             return None
         logger.debug("OpenSubtitles search: %d entries for S%02dE%02d (%s)", len(results), season, episode, requested)
+
+        if quota_blocked and self._cache is not None:
+            # Audit E2: only the /download endpoint is quota-limited — an SRT
+            # already in the local cache stays usable after a 406. Restrict the
+            # candidate loop to cached hits before giving up.
+            def cached_alive(item: dict[str, Any]) -> bool:
+                subtitle_id = str(item.get("id") or "")
+                if not subtitle_id:
+                    return False
+                cached = self._cache.get_osdb_subtitle(subtitle_id)  # type: ignore[union-attr]
+                if not (cached and cached.get("_srt_path")):
+                    return False
+                return Path(cached["_srt_path"]).is_file()
+
+            results = [item for item in results if cached_alive(item)]
+            if not results:
+                logger.debug(
+                    "Skipping OpenSubtitles download for S%02dE%02d — daily quota exhausted until %s "
+                    "and no cached subtitle available",
+                    season,
+                    episode,
+                    time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(self._quota_blocked_until)),
+                )
+                return None
+            logger.info(
+                "Quota exhausted but %d cached subtitle(s) available for S%02dE%02d — using the cache",
+                len(results),
+                season,
+                episode,
+            )
 
         # Prefer results with a download signal; fall back to first.
         def rank(item: dict[str, Any]) -> tuple[int, int]:

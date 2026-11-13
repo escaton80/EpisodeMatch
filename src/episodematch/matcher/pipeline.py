@@ -280,6 +280,11 @@ class Pipeline:
                 work_dir=self._config.audio_cache_dir,
                 model_size=self._config.extraction.whisper_model,
                 language=self._config.extraction.whisper_language,
+                # Audit F4: configurable scan windows (config stores minutes).
+                window_1_start=self._config.extraction.audio_window_1_start_min * 60.0,
+                window_1_end=self._config.extraction.audio_window_1_end_min * 60.0,
+                minutes_before_end=self._config.extraction.audio_window_2_minutes_before_end * 60.0,
+                window_2_length=self._config.extraction.audio_window_2_length_min * 60.0,
             )
         return self._audio_snipper
 
@@ -292,6 +297,7 @@ class Pipeline:
                 work_dir=self._config.frame_cache_dir,
                 scene_threshold=self._config.extraction.scene_change_threshold,
                 max_frames_per_window=self._config.extraction.max_frames_per_window,
+                title_card_minutes=self._config.extraction.title_card_window_minutes,
             )
         return self._frame_scanner
 
@@ -445,7 +451,7 @@ class Pipeline:
         season: int,
     ) -> None:
         if options.discdb_url:
-            self._stage_disc_db_from_url(probed, report, options, url=options.discdb_url)
+            self._stage_disc_db_from_url(probed, report, options, url=options.discdb_url, season=season)
             return
         client = self._disc_client(options)
         if client is None:
@@ -485,7 +491,7 @@ class Pipeline:
             for mkv, _candidate in probed:
                 self._report(report, mkv.file_name, "disc_db", "failed", str(exc))
             return
-        self._apply_disc_matches(probed, report, discs, source="thediscdb")
+        self._apply_disc_matches(probed, report, discs, source="thediscdb", season=season)
 
     def _stage_disc_db_from_url(
         self,
@@ -494,6 +500,7 @@ class Pipeline:
         options: ScanOptions,
         *,
         url: str,
+        season: int,
     ) -> None:
         """Load exactly the disc/release a pasted thediscdb.com URL points at."""
         from episodematch.providers.thediscdb import resolve_discs_from_url
@@ -519,7 +526,7 @@ class Pipeline:
         )
         # With the disc pinned by URL, the MakeMKV title index in the file name
         # (…_t07.mkv) identifies the title near-conclusively.
-        self._apply_disc_matches(probed, report, discs, source=url, index_weight=0.90)
+        self._apply_disc_matches(probed, report, discs, source=url, index_weight=0.90, season=season)
 
     def _apply_disc_matches(
         self,
@@ -529,6 +536,7 @@ class Pipeline:
         *,
         source: str,
         index_weight: float = 0.25,
+        season: int,
     ) -> None:
         """Score every file against the loaded disc entries and record evidence."""
         if not discs:
@@ -548,6 +556,18 @@ class Pipeline:
                 self._report(report, mkv.file_name, "disc_db", "ok", "No disc fingerprint match")
                 continue
             best = matches[0]
+            # Audit A1: evidence for a *different* season must never become
+            # evidence for the requested season (S02E01 rip was assigned as
+            # S01E01 @ 1.0). Extras with unknown season pass through untouched.
+            if best.season is not None and best.season != season:
+                self._report(
+                    report,
+                    mkv.file_name,
+                    "disc_db",
+                    "ok",
+                    f"Disc fingerprint matches Season {best.season} — ignored (requested season {season})",
+                )
+                continue
             # Gate: a duration/size-only coincidence across many releases (often
             # a different season) must not become evidence — require a real
             # identifier (MPLS or index match) or a solid score.
@@ -579,6 +599,7 @@ class Pipeline:
                         "disc": best.disc.disc_name,
                     },
                     episode_hint=best.episode,
+                    season_hint=best.season,
                 )
             )
             self._report(report, mkv.file_name, "disc_db", "ok", f"{best.score:.0%} via {best.reasons[:2]}")
@@ -588,9 +609,21 @@ class Pipeline:
         """Find release folders that likely contain the wanted season."""
         folders = client.list_releases(series_folder)
         # Prefer folders explicitly mentioning the season number — including
-        # combined boxes like "seasons-6-10-blu-ray" (note the plural "seasons").
-        pattern = re.compile(rf"seasons?[-_ ]?0*{season}\b", re.IGNORECASE)
-        preferred = [name for name in folders if pattern.search(name.lower())]
+        # combined boxes like "seasons-6-10-blu-ray", which (audit F5) must
+        # match every season inside its range, not only its first season.
+        exact = re.compile(rf"seasons?[-_ ]?0*{season}\b", re.IGNORECASE)
+        season_range = re.compile(
+            r"seasons?[-_ ]?(\d{1,2})[-_ ]?(?:to|through|[-_ ])[-_ ]?(\d{1,2})",
+            re.IGNORECASE,
+        )
+
+        def matches(name: str) -> bool:
+            lowered = name.lower()
+            if exact.search(lowered):
+                return True
+            return any(int(lo) <= season <= int(hi) for lo, hi in season_range.findall(lowered))
+
+        preferred = [name for name in folders if matches(name)]
         return preferred or folders
 
     def _build_season_guide(self, report: ScanReport, *, series: str, season: int) -> SeasonGuide | None:

@@ -75,6 +75,10 @@ class AudioSnipper:
         device: str = "cpu",
         compute_type: str = "int8",
         keep_temp_files: bool = False,
+        window_1_start: float = 150.0,
+        window_1_end: float = 270.0,
+        minutes_before_end: float = 300.0,
+        window_2_length: float = 120.0,
     ) -> None:
         self._ffmpeg = Path(ffmpeg_path)
         self._work_dir = Path(work_dir) if work_dir else Path.cwd() / "data" / "audio"
@@ -83,8 +87,31 @@ class AudioSnipper:
         self._device = device
         self._compute_type = compute_type
         self._keep_temp_files = keep_temp_files
+        # Audit F4: the scan windows come from ExtractionSettings (seconds) —
+        # previously they were hard-coded defaults that the config could not
+        # reach.
+        self._window_1_start = window_1_start
+        self._window_1_end = window_1_end
+        self._minutes_before_end = minutes_before_end
+        self._window_2_length = window_2_length
         self._work_dir.mkdir(parents=True, exist_ok=True)
         self._whisper_model: object | None = None
+
+    @property
+    def window_1_start(self) -> float:
+        return self._window_1_start
+
+    @property
+    def window_1_end(self) -> float:
+        return self._window_1_end
+
+    @property
+    def minutes_before_end(self) -> float:
+        return self._minutes_before_end
+
+    @property
+    def window_2_length(self) -> float:
+        return self._window_2_length
 
     # -- ffmpeg extraction ------------------------------------------------------
 
@@ -127,7 +154,13 @@ class AudioSnipper:
     def extract_windows(self, mkv_path: Path, duration_seconds: float | None) -> list[AudioWindow]:
         """Extract all configured windows of one file."""
         windows: list[AudioWindow] = []
-        for start, end in compute_audio_windows(duration_seconds):
+        for start, end in compute_audio_windows(
+            duration_seconds,
+            window_1_start=self._window_1_start,
+            window_1_end=self._window_1_end,
+            minutes_before_end=self._minutes_before_end,
+            window_2_length=self._window_2_length,
+        ):
             try:
                 windows.append(self.extract_window(mkv_path, start, end))
             except ExtractionError as exc:

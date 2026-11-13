@@ -247,19 +247,20 @@ class FfprobeReader:
         if not ebml.tracks:
             return
         offset = max((s.index for s in mkv.streams), default=-1) + 1
-        for index, track in enumerate(ebml.tracks):
-            if track.get("type") != "subtitle":
+        for track in ebml.tracks:
+            if track.track_type != "subtitle":
                 continue
             mkv.streams.append(
                 StreamInfo(
-                    index=offset + index,
+                    index=offset,
                     stream_type=StreamType.SUBTITLE,
-                    codec_name=track.get("codec_id"),
-                    language=track.get("language"),
-                    title=track.get("name"),
-                    subtitle_format=_EBML_CODEC_MAP.get(track.get("codec_id", "").upper()),
+                    codec_name=track.codec_id,
+                    language=track.language,
+                    title=track.name,
+                    subtitle_format=_EBML_CODEC_MAP.get((track.codec_id or "").upper()),
                 )
             )
+            offset += 1
 
 
 # ---------------------------------------------------------------------------

@@ -453,6 +453,10 @@ class MatchCandidate(BaseModel):
     scores: dict[str, float] = Field(default_factory=dict)  # pillar value -> score
     # episode_number -> accumulated score for that episode of the season
     episode_scores: dict[int, float] = Field(default_factory=dict)
+    # Audit A4: strongest evidence score per (pillar, episode). The episode
+    # score is the calibrated sum across pillars — multi-pillar reinforcement
+    # without intra-pillar double counting.
+    pillar_episode_scores: dict[str, dict[int, float]] = Field(default_factory=dict)
 
     @field_validator("file_path", mode="before")
     @classmethod
@@ -466,8 +470,15 @@ class MatchCandidate(BaseModel):
         self.scores[key] = max(self.scores.get(key, 0.0), evidence.score)
         if evidence.episode_hint is not None:
             episode = evidence.episode_hint
-            contribution = evidence.score * evidence.score  # square: reward sharp evidence
-            self.episode_scores[episode] = self.episode_scores.get(episode, 0.0) + contribution
+            per_pillar = self.pillar_episode_scores.setdefault(key, {})
+            # Calibrated aggregation (audit A4): the strongest evidence per
+            # pillar per episode, summed across pillars — no blind squaring,
+            # which mismatched the DiscDB scale with the solver threshold.
+            per_pillar[episode] = max(per_pillar.get(episode, 0.0), evidence.score)
+            self.episode_scores[episode] = sum(
+                pillar_max.get(episode, 0.0)
+                for pillar_max in self.pillar_episode_scores.values()
+            )
 
 
 class ArbiterAssignment(BaseModel):

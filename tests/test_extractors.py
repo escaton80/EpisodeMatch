@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import io
 import struct
+from pathlib import Path
 
 import pytest
 from PIL import Image
 
 from episodematch.core.exceptions import ExtractionError
-from episodematch.core.models import MkvFile, StreamType, SubtitleFormat
+from episodematch.core.models import MkvFile, StreamInfo, StreamType, SubtitleFormat
 from episodematch.extractors.audio_snipper import compute_audio_windows
 from episodematch.extractors.ffprobe_reader import (
     parse_ffprobe_json,
+    EbmlMetadata,
+    EbmlTrack,
     read_ebml_metadata,
 )
 from episodematch.extractors.frame_scanner import (
@@ -410,6 +413,13 @@ class TestSceneParsing:
         times = parse_lavfi_scene_lines(output)
         assert 12.345 in times
 
+    def test_single_column_bare_timestamps(self) -> None:
+        """Audit C5: ffprobe -of csv=p=0 with a single field prints bare
+        pts_time rows; they must parse instead of always falling through to
+        the slow ffmpeg path."""
+        output = "12.345678\n42.000000\n"
+        assert parse_lavfi_scene_lines(output) == [12.345678, 42.0]
+
     def test_empty_output(self) -> None:
         assert parse_lavfi_scene_lines("") == []
 
@@ -645,7 +655,7 @@ class TestSubtitleEditFastPath:
             lambda: type(
                 "FakeParser",
                 (),
-                {"parse_file": lambda self, path: list(events)},
+                {"parse_file": lambda self, path, pts_windows=None: list(events)},
             )(),
         )
 
@@ -665,6 +675,74 @@ class TestSubtitleEditFastPath:
         assert ocr.calls == 40
         assert transcript.lines[0].start_seconds == 0.0
         assert transcript.lines[-1].start_seconds == pytest.approx(39 * 30.0)
+
+    def test_pgs_fallback_decodes_only_window_events(self, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Audit C4: the Python PGS pipeline must not RLE-decode the whole film —
+        only events inside the scan window reach decode+OCR."""
+        from episodematch.extractors.pgs_parser import (
+            Palette,
+            PaletteEntry,
+            PgsBitmap,
+            build_sup_event,
+        )
+        from episodematch.extractors.subtitle_extractor import SubtitleExtractor
+        from tests.conftest import FakeOcrBackend
+
+        sup_path = tmp_path / "title_t00.track1.sup"
+        sup_path.parent.mkdir(parents=True, exist_ok=True)
+        palette = Palette(
+            palette_id=0,
+            version=0,
+            entries={1: PaletteEntry(color_id=1, y=200, cr=128, cb=128, alpha=255)},
+        )
+        bitmap = PgsBitmap(object_id=1, x=100, y=500, width=4, height=4, indices=bytes([1] * 16), forced=False)
+        sup = b"".join(
+            build_sup_event(
+                start_seconds=float(i) * 30.0,
+                end_seconds=float(i) * 30.0 + 2.0,
+                bitmaps=[bitmap],
+                palette=palette,
+                composition_number=i,
+            )
+            for i in range(80)  # 40 minutes of subtitles
+        )
+        sup_path.write_bytes(sup)
+
+        calls = {"n": 0}
+        import episodematch.extractors.pgs_parser as pgs_module
+
+        real_decode = pgs_module.decode_rle
+
+        def counting_decode(data: bytes | bytearray, width: int, height: int) -> bytearray:
+            calls["n"] += 1
+            return real_decode(data, width, height)
+
+        monkeypatch.setattr(pgs_module, "decode_rle", counting_decode)
+        monkeypatch.setattr(SubtitleExtractor, "_dump_sup", lambda self, mkv, track: sup_path)
+
+        ocr = FakeOcrBackend(["HELLO"])
+        extractor = SubtitleExtractor(
+            mkvextract_path=None,
+            ffmpeg_path=None,
+            ocr=ocr,
+            work_dir=tmp_path / "subs",
+            subtitle_edit_path=None,
+        )
+        mkv, track = _pgs_track()
+        transcript = extractor.extract(
+            mkv,
+            track,
+            duration_seconds=2400.0,
+            window_minutes=10.0,
+            ocr_max_events=40,
+        )
+
+        assert transcript.source == "pgs-ocr"
+        assert len(transcript.lines) == 40
+        assert ocr.calls == 40
+        # 21 events in the first 10 min + 20 in the last 10 min are decoded;
+        # the other 39 of the 80-event film are never touched (audit C4).
+        assert calls["n"] == 41
 
     def test_no_se_and_no_ocr_raises_with_hint(self, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
         from episodematch.core.exceptions import ExtractionError
@@ -936,3 +1014,92 @@ class TestSelectSubtitleStreams:
         from episodematch.extractors.subtitle_extractor import select_subtitle_streams
 
         assert select_subtitle_streams(self._mkv_with(), ["ger"]) == []
+
+class TestEbmlTrackMergeFallback:
+    """Audit B5: _merge_ebml_tracks treated EbmlTrack as a dict (track.get)
+    and crashed with AttributeError exactly when ffprobe failed and the
+    native EBML fallback kicked in."""
+
+    def test_merge_adds_subtitle_streams_from_ebml_tracks(self) -> None:
+        from episodematch.extractors.ffprobe_reader import FfprobeReader
+
+        mkv = MkvFile(path=Path("D:/disc/title_t00.mkv"), duration_seconds=2400.0, streams=[])
+        ebml = EbmlMetadata(
+            tracks=[
+                EbmlTrack(track_type="video", codec_id="V_MPEGH/ISO/AVC"),
+                EbmlTrack(track_type="subtitle", codec_id="S_HDMV/PGS", language="ger", name="German forced", forced=True),
+                EbmlTrack(track_type="audio", codec_id="A_DTS", language="eng"),
+            ]
+        )
+        FfprobeReader._merge_ebml_tracks(mkv, ebml)
+        assert len(mkv.streams) == 1  # only subtitles merge
+        stream = mkv.streams[0]
+        assert stream.stream_type == StreamType.SUBTITLE
+        assert stream.codec_name == "S_HDMV/PGS"
+        assert stream.language == "ger"
+        assert stream.title == "German forced"
+
+    def test_merge_offset_starts_after_existing_streams(self) -> None:
+        from episodematch.extractors.ffprobe_reader import FfprobeReader
+
+        mkv = MkvFile(
+            path=Path("D:/disc/title_t00.mkv"),
+            duration_seconds=2400.0,
+            streams=[StreamInfo(index=0, stream_type=StreamType.VIDEO)],
+        )
+        ebml = EbmlMetadata(tracks=[EbmlTrack(track_type="subtitle", codec_id="S_TEXT/UTF8", language="eng")])
+        FfprobeReader._merge_ebml_tracks(mkv, ebml)
+        assert mkv.streams[1].index == 1
+
+    def test_merge_with_empty_tracks_is_noop(self) -> None:
+        from episodematch.extractors.ffprobe_reader import FfprobeReader
+
+        mkv = MkvFile(path=Path("D:/disc/title_t00.mkv"), duration_seconds=2400.0, streams=[])
+        FfprobeReader._merge_ebml_tracks(mkv, EbmlMetadata())
+        assert mkv.streams == []
+
+class TestScanWindowPlumbing:
+    """Audit F4: the audio/visual scan windows must come from the configured
+    ExtractionSettings, not from hard-coded defaults."""
+
+    def test_audio_snipper_uses_configured_windows(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from episodematch.extractors.audio_snipper import AudioSnipper
+
+        snipper = AudioSnipper(
+            ffmpeg_path=tmp_path / "ffmpeg.exe",
+            work_dir=tmp_path / "audio",
+            window_1_start=10.0,
+            window_1_end=20.0,
+            minutes_before_end=60.0,
+            window_2_length=30.0,
+        )
+        captured: list[tuple[float, float]] = []
+
+        def fake_extract_window(mkv_path: Path, start: float, end: float) -> object:
+            captured.append((start, end))
+            return object()
+
+        monkeypatch.setattr(snipper, "extract_window", fake_extract_window)
+        snipper.extract_windows(tmp_path / "title_t00.mkv", duration_seconds=1000.0)
+        assert captured == [(10.0, 20.0), (938.0, 968.0)]  # end=998, start=938, capped at 938+30
+
+    def test_frame_scanner_uses_configured_title_window(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from episodematch.extractors.frame_scanner import FrameScanner
+        from tests.conftest import FakeOcrBackend
+
+        scanner = FrameScanner(
+            ffmpeg_path=tmp_path / "ffmpeg.exe",
+            ffprobe_path=tmp_path / "ffprobe.exe",
+            ocr=FakeOcrBackend([]),
+            work_dir=tmp_path / "frames",
+            title_card_minutes=2.0,
+        )
+        captured: list[tuple[float, float]] = []
+
+        def fake_detect(mkv_path: Path, start: float, end: float, *, limit: int) -> list[float]:
+            captured.append((start, end))
+            return []
+
+        monkeypatch.setattr(scanner, "detect_scene_changes", fake_detect)
+        scanner.scan(tmp_path / "title_t00.mkv", duration_seconds=2400.0)
+        assert (0.0, 120.0) in captured  # 2-minute title window, not the 5-minute default

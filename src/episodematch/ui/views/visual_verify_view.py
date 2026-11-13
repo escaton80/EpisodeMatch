@@ -141,3 +141,7 @@ class VisualVerifyView(QWidget):
 
     def shutdown(self) -> None:
         self._scrubber.shutdown()
+
+    def is_busy(self) -> bool:
+        """The verify view only plays media — it never touches the database."""
+        return False

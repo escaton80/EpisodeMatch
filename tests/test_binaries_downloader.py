@@ -21,7 +21,7 @@ from episodematch.core.bin_downloader import (
 )
 from episodematch.core.binaries import ToolResolver, locate_tool, probe_version
 from episodematch.core.config import AppConfig, apply_env_overrides
-from episodematch.core.exceptions import BinaryDownloadError, BinaryNotFoundError, ConfigError
+from episodematch.core.exceptions import BinaryDownloadError, BinaryNotFoundError, ConfigError, EpisodeMatchError
 from episodematch.core.database import CacheDatabase
 from episodematch.main import main
 
@@ -385,8 +385,21 @@ class TestConfig:
         assert "abcdefghijk" not in masked["tmdb_api_key"]
         assert masked["llm_api_key"] == ""
 
+    def test_masked_keys_cover_subdl(self) -> None:
+        """Audit F1: the SubDL API key must be masked like the other keys."""
+        config = AppConfig(
+            subdl_api_key="abcdefghijk",
+            tmdb_api_key="tmdb-long-key-value",
+            opensubtitles_api_key="osdt-long-key",
+            llm_api_key="llm-long-key-1234567890",
+        )
+        masked = config.masked()
+        assert "abcdefghijk" not in json.dumps(masked)
+        assert "abcdefghijk" not in str(masked.get("subdl_api_key"))
+
 
 class TestPathResolution:
+
     def test_find_project_root_finds_checkout(self) -> None:
         from episodematch.core.config import find_project_root
 
@@ -406,27 +419,38 @@ class TestPathResolution:
         resolved = AppConfig().resolve_path("bin")
         assert resolved == root / "bin"
 
-    def test_frozen_exe_keeps_cwd_relative(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Packaged dist layout: the copied folder's own bin/data win — the
-        frozen build must never hijack the developer checkout."""
+    def test_frozen_exe_anchors_at_executable_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Audit F2: frozen builds anchor bin/data at the EXE directory, not the
+        launch CWD — a shortcut started from anywhere must not fork the tools."""
         import sys
 
         from episodematch.core.config import AppConfig
 
-        (tmp_path / "bin").mkdir()
-        monkeypatch.chdir(tmp_path)
+        exe_dir = tmp_path / "EpisodeMatch"
+        exe_dir.mkdir()
+        (exe_dir / "bin").mkdir()
+        foreign_cwd = tmp_path / "elsewhere"
+        foreign_cwd.mkdir()
+        (foreign_cwd / "bin").mkdir()  # a same-named bin/ in the CWD must NOT win
+        monkeypatch.chdir(foreign_cwd)
         monkeypatch.setattr(sys, "frozen", True, raising=False)
-        resolved = AppConfig().resolve_path("bin")
-        assert resolved == tmp_path / "bin"
+        monkeypatch.setattr(sys, "executable", str(exe_dir / "EpisodeMatch.exe"))
+        assert AppConfig().resolve_path("bin") == exe_dir / "bin"
 
-    def test_frozen_exe_missing_dir_stays_cwd(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_frozen_exe_missing_bin_anchors_at_exe_dir_anyway(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         import sys
 
         from episodematch.core.config import AppConfig
 
-        monkeypatch.chdir(tmp_path)  # no bin/ here at all
+        exe_dir = tmp_path / "EpisodeMatch"
+        exe_dir.mkdir()  # no bin/ next to the exe yet
+        foreign_cwd = tmp_path / "elsewhere"
+        foreign_cwd.mkdir()
+        (foreign_cwd / "bin").mkdir()  # CWD fallback would silently fork here
+        monkeypatch.chdir(foreign_cwd)
         monkeypatch.setattr(sys, "frozen", True, raising=False)
-        assert AppConfig().resolve_path("bin") == tmp_path / "bin"
+        monkeypatch.setattr(sys, "executable", str(exe_dir / "EpisodeMatch.exe"))
+        assert AppConfig().resolve_path("bin") == exe_dir / "bin"
 
     def test_resolve_path_falls_back_to_project_root(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Started from a foreign CWD (double-clicked shim), bin/data resolve to
@@ -533,3 +557,45 @@ class TestCli:
         (folder / "title_t00.mkv").write_bytes(b"\x1a\x45\xdf\xa3" + b"\x00" * 64)
         code = main(["match", str(folder), "--series", "X", "--season", "1", "--json", "--no-discdb"])
         assert code == 1  # ffprobe missing -> clean failure, no traceback
+
+class TestReadOnlyDatabase:
+    """Audit F6: read_only=True must actually enforce read-only access."""
+
+    def test_read_only_connection_cannot_write(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "cache.sqlite3"
+        writer = CacheDatabase(db_path)
+        writer.put_json("k", {"a": 1})
+        writer.close()
+
+        ro = CacheDatabase(db_path, read_only=True)
+        try:
+            with pytest.raises(EpisodeMatchError, match="read-only"):
+                ro.put_json("k2", {"b": 2})
+            with pytest.raises(EpisodeMatchError, match="read-only"):
+                ro.delete("k")
+            with pytest.raises(EpisodeMatchError, match="read-only"):
+                ro.purge_expired()
+            with pytest.raises(EpisodeMatchError, match="read-only"):
+                ro.put_mkv_scan(Path("x.mkv"), 1, 1, {})
+            with pytest.raises(EpisodeMatchError, match="read-only"):
+                ro.put_disc("cache-key", "series", {})
+            with pytest.raises(EpisodeMatchError, match="read-only"):
+                ro.put_osdb_subtitle("sub", {}, None)
+            with pytest.raises(EpisodeMatchError, match="read-only"):
+                ro.vacuum()
+            # reads keep working and the data is intact
+            assert ro.get_json("k") == {"a": 1}
+        finally:
+            ro.close()
+
+    def test_read_only_sqlite_layer_rejects_writes(self, tmp_path: Path) -> None:
+        import sqlite3
+
+        db_path = tmp_path / "cache.sqlite3"
+        CacheDatabase(db_path).close()
+        ro = CacheDatabase(db_path, read_only=True)
+        try:
+            with pytest.raises(sqlite3.OperationalError):
+                ro._conn.execute("CREATE TABLE should_fail (x INT)")
+        finally:
+            ro.close()

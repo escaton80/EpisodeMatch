@@ -13,7 +13,7 @@ from episodematch.core.models import (
     TitleCardKind,
     Transcript,
 )
-from episodematch.matcher.credit_scorer import match_name, score_episode_credits
+from episodematch.matcher.credit_scorer import credit_evidence, match_name, score_episode_credits
 from episodematch.matcher.text_scorer import (
     align_dialogs,
     best_line_match,
@@ -262,3 +262,19 @@ class TestCreditScorer:
     def test_fuzz_sanity(self) -> None:
         # Sanity guard: the fuzzy backend behaves as expected for near-identical names.
         assert fuzz.token_sort_ratio("Vince Gilligan", "Gilligan Vince") == 100
+
+
+class TestCreditEvidenceDisplayOnly:
+    def test_credit_evidence_has_no_episode_hint(self) -> None:
+        """Audit A4(a): per-hit evidence is display-only - the calibrated score
+        comes from the summary evidence, so the aggregation must not
+        double-count the observation."""
+        hits = [TitleCardHit(timestamp_seconds=40.0, kind=TitleCardKind.CREDITS,
+                             raw_lines=["Directed by Michelle MacLaren"],
+                             directors=["Michelle MacLaren"])]
+        episode = EpisodeInfo(season=1, episode=4, title="X",
+                              directors=["Michelle MacLaren"])
+        score = score_episode_credits(hits, episode)
+        items = credit_evidence(hits, score)
+        assert items
+        assert all(item.episode_hint is None for item in items)

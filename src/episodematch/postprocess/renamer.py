@@ -126,6 +126,25 @@ def _resolve_collision(destination: Path, used: set[str]) -> Path:
             raise RenameError(f"Cannot find a free name for {destination}")
 
 
+def repoint_entries(entries: list[AssignmentEntry], applied: list[RenamePlanItem]) -> int:
+    """Update solved entries to the NEW paths after renames were applied.
+
+    Audit B4: ``--rename --tag`` in one CLI run must tag the renamed files, not
+    the vanished originals. Mutates ``entries`` in place; returns the number of
+    entries that were repointed.
+    """
+    source_to_destination = {item.source: item.destination for item in applied if item.source != item.destination}
+    if not source_to_destination:
+        return 0
+    repointed = 0
+    for entry in entries:
+        destination = source_to_destination.get(entry.file_path)
+        if destination is not None:
+            entry.file_path = destination
+            repointed += 1
+    return repointed
+
+
 class Renamer:
     """Applies rename plans and journals them for undo."""
 
@@ -148,46 +167,66 @@ class Renamer:
                 continue
             if item.destination.exists():
                 raise RenameError(f"Destination already exists: {item.destination}")
+            # Audit B1: a stale temporary file from an earlier crashed run would
+            # abort the batch *mid-loop* (after earlier renames) — fail fast here.
+            temp = item.destination.with_name(f".{item.destination.stem}.emtmp{item.destination.suffix}")
+            if temp.exists():
+                raise RenameError(f"Temporary rename target already exists: {temp}")
             if item.source.parent != item.destination.parent:
                 item.destination.parent.mkdir(parents=True, exist_ok=True)
 
     # -- apply / undo ------------------------------------------------------------
 
     def apply(self, plan: RenamePlan) -> list[RenamePlanItem]:
-        """Apply the plan (or nothing when ``dry_run``) and journal it."""
+        """Apply the plan and journal every completed rename incrementally.
+
+        Audit B1: the journal is written *while* the batch runs, so a mid-batch
+        failure (disk error, vanished source) leaves an undo journal for the
+        renames that already happened — and OSError is wrapped into
+        :class:`RenameError` so the CLI reports it properly.
+        """
         self.validate(plan)
         if plan.dry_run:
             logger.info("Dry run: %d files would be renamed", len(plan.items))
             return list(plan.items)
         applied: list[RenamePlanItem] = []
-        for item in plan.items:
-            if item.source == item.destination:
-                continue
-            item.destination.parent.mkdir(parents=True, exist_ok=True)
-            # Rename via a temp name on the same volume to survive case-only renames.
-            temp = item.destination.with_name(f".{item.destination.stem}.emtmp{item.destination.suffix}")
-            item.source.rename(temp)
-            temp.rename(item.destination)
-            applied.append(item)
-            logger.info("Renamed %s -> %s", item.source.name, item.destination)
-        if applied:
-            self._write_journal(applied)
+        operations: list[dict[str, str]] = []
+        journal_path = self._new_journal_path()
+        try:
+            for item in plan.items:
+                if item.source == item.destination:
+                    continue
+                item.destination.parent.mkdir(parents=True, exist_ok=True)
+                temp = item.destination.with_name(f".{item.destination.stem}.emtmp{item.destination.suffix}")
+                if temp.exists():
+                    raise RenameError(f"Temporary rename target already exists: {temp}")
+                try:
+                    item.source.rename(temp)
+                    temp.rename(item.destination)
+                except OSError as exc:
+                    raise RenameError(f"Rename failed for {item.source.name}: {exc}") from exc
+                applied.append(item)
+                operations.append({"source": str(item.source), "destination": str(item.destination)})
+                # Incremental journal: every completed rename is undoable, even
+                # if the batch is interrupted right after it.
+                self._write_journal_file(journal_path, operations)
+                logger.info("Renamed %s -> %s", item.source.name, item.destination)
+        finally:
+            if not operations:
+                journal_path.unlink(missing_ok=True)  # nothing applied -> drop empty journal
         return applied
 
-    def _write_journal(self, applied: list[RenamePlanItem]) -> Path:
+    def _new_journal_path(self) -> Path:
         timestamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-        # Two batches can finish within the same microsecond; the unique suffix
-        # guarantees the older journal is never overwritten (undo history loss).
-        journal_path = self._undo_dir / f"rename-{timestamp}-{uuid4().hex[:8]}.json"
+        return self._undo_dir / f"rename-{timestamp}-{uuid4().hex[:8]}.json"
+
+    @staticmethod
+    def _write_journal_file(journal_path: Path, operations: list[dict[str, str]]) -> None:
         payload = {
             "timestamp": _dt.datetime.now().isoformat(),
-            "operations": [
-                {"source": str(item.source), "destination": str(item.destination)} for item in applied
-            ],
+            "operations": [dict(op) for op in operations],
         }
         journal_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-        logger.info("Undo journal written: %s", journal_path)
-        return journal_path
 
     def list_journals(self) -> list[Path]:
         return sorted(self._undo_dir.glob("rename-*.json"), reverse=True)

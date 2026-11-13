@@ -251,3 +251,124 @@ class TestConfigSubtitleSource:
 
         with pytest.raises(pydantic.ValidationError):
             AppConfig(subtitle_source="kotlin")
+
+class TestMalformedJsonResponse:
+    """Audit B6: a 200 response with a non-JSON body (proxy error page,
+    HTML rate-limit wall) must surface as ProviderError, not a raw
+    json.JSONDecodeError that escapes every error handler."""
+
+    def test_get_with_html_body_raises_provider_error(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, text="<html>Service Temporarily Unavailable</html>")
+
+        client = _make_client(handler)
+        with pytest.raises(ProviderError, match="not JSON"):
+            client._get("https://api3.subdl.com/api/v1/subtitles", {"film_name": "x"})
+
+class TestSubdlCandidateValidation:
+    """Audit E1: SubDL's search filter is loose — results for other episodes
+    and languages can come back. Wrong candidates must be rejected, and the
+    transcript language must come from the actual match, not the request."""
+
+    def _handler_with(self, candidates: list[dict[str, Any]], served: dict[str, bytes]) -> Any:
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.startswith("https://api3.subdl.com/api/v1/subtitles"):
+                return httpx.Response(200, json={"status": True, "subtitles": candidates})
+            for suffix, content in served.items():
+                if url == f"https://dl.subdl.com{suffix}":
+                    return httpx.Response(200, content=content)
+            return httpx.Response(404)
+
+        return handler
+
+    def test_wrong_episode_candidate_is_rejected(self) -> None:
+        """An E2 release returned for an E1 request is never downloaded."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.startswith("https://api3.subdl.com/api/v1/subtitles"):
+                return httpx.Response(
+                    200,
+                    json={"status": True, "subtitles": [_subtitle_entry("s2", "/subtitle/e2.zip", episode=2)]},
+                )
+            downloaded.append(url)
+            if url == "https://dl.subdl.com/subtitle/e2.zip":
+                return httpx.Response(200, content=_zip_bytes(("sub.srt", _SRT_BYTES)))
+            return httpx.Response(404)
+
+        downloaded: list[str] = []
+        client = _make_client(handler)
+        transcript = client.reference_transcript(tmdb_id=1, season=1, episode=1, languages="de")
+        assert transcript is None  # the only candidate is the wrong episode
+        assert not downloaded  # never even fetched the wrong episode
+
+    def test_wrong_language_candidate_is_rejected(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.startswith("https://api3.subdl.com/api/v1/subtitles"):
+                entry = _subtitle_entry("s1", "/subtitle/fr.zip")
+                entry["lang"] = "FR"
+                return httpx.Response(200, json={"status": True, "subtitles": [entry]})
+            if url == "https://dl.subdl.com/subtitle/fr.zip":
+                return httpx.Response(200, content=_zip_bytes(("sub.srt", _SRT_BYTES)))
+            return httpx.Response(404)
+
+        client = _make_client(handler)
+        transcript = client.reference_transcript(tmdb_id=1, season=1, episode=1, languages="de")
+        assert transcript is None  # fr content must not be served for a de request
+
+    def test_language_labeled_from_actual_candidate(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.startswith("https://api3.subdl.com/api/v1/subtitles"):
+                entry = _subtitle_entry("s1", "/subtitle/de.zip")
+                entry["lang"] = "DE"
+                return httpx.Response(200, json={"status": True, "subtitles": [entry]})
+            if url == "https://dl.subdl.com/subtitle/de.zip":
+                return httpx.Response(200, content=_zip_bytes(("sub.srt", _SRT_BYTES)))
+            return httpx.Response(404)
+
+        client = _make_client(handler)
+        transcript = client.reference_transcript(tmdb_id=1, season=1, episode=1, languages="de,en")
+        assert transcript is not None
+        assert transcript.language == "de"  # from the candidate, not just the request head
+
+    def test_correct_episode_preferred_and_mismatched_url_untouched(self) -> None:
+        candidates = [
+            _subtitle_entry("wrong", "/subtitle/e2.zip", episode=2),
+            _subtitle_entry("right", "/subtitle/e1.zip", episode=1),
+        ]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.startswith("https://api3.subdl.com/api/v1/subtitles"):
+                return httpx.Response(200, json={"status": True, "subtitles": candidates})
+            downloaded.append(url)
+            if url == "https://dl.subdl.com/subtitle/e1.zip":
+                return httpx.Response(200, content=_zip_bytes(("sub.srt", _SRT_BYTES)))
+            return httpx.Response(404)
+
+        downloaded: list[str] = []
+        client = _make_client(handler)
+        transcript = client.reference_transcript(tmdb_id=1, season=1, episode=1, languages="de")
+        assert transcript is not None
+        assert downloaded == ["https://dl.subdl.com/subtitle/e1.zip"]
+
+    def test_candidates_without_fields_are_tolerated(self) -> None:
+        """Missing episode/lang fields must not reject a candidate (the fields
+        are optional in SubDL responses)."""
+        entry = {"release_name": "opaque", "name": "n", "url": "/subtitle/x.zip"}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.startswith("https://api3.subdl.com/api/v1/subtitles"):
+                return httpx.Response(200, json={"status": True, "subtitles": [entry]})
+            if url == "https://dl.subdl.com/subtitle/x.zip":
+                return httpx.Response(200, content=_zip_bytes(("sub.srt", _SRT_BYTES)))
+            return httpx.Response(404)
+
+        client = _make_client(handler)
+        transcript = client.reference_transcript(tmdb_id=1, season=1, episode=1, languages="de")
+        assert transcript is not None
+        assert transcript.language == "de"  # fallback: requested language

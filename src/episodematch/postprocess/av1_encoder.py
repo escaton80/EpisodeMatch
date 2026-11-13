@@ -135,12 +135,29 @@ class Av1EncoderQueue:
 
     # -- queue management ----------------------------------------------------------
 
-    def add_job(self, source: Path, destination: Path | None = None, *, preset: int = 6, crf: int = 30) -> EncoderJob:
-        """Queue one file (skips duplicates and existing outputs)."""
+    def add_job(
+        self,
+        source: Path,
+        destination: Path | None = None,
+        *,
+        preset: int = 6,
+        crf: int = 30,
+        overwrite: bool = False,
+    ) -> EncoderJob:
+        """Queue one file (skips duplicates; refuses existing outputs unless ``overwrite``).
+
+        Audit B3: the encoder would silently replace a finished ``*.av1.mkv`` at
+        the final ``replace()`` step — losing hours of encoding time if the user
+        queued the same folder twice. Fail fast instead.
+        """
         source = Path(source)
         if not source.is_file():
             raise EncodingError(f"Source not found: {source}")
         destination = Path(destination) if destination else source.with_name(source.stem + ".av1.mkv")
+        if destination.exists() and not overwrite:
+            raise EncodingError(
+                f"Destination already exists (use overwrite=True to re-encode): {destination}"
+            )
         for job in self._jobs:
             if job.source == source and job.destination == destination:
                 return job
@@ -218,6 +235,23 @@ class Av1EncoderQueue:
             self._save_state()
             return
         assert process.stdout is not None
+        # Audit D1: stderr is drained in a background thread while the stdout
+        # progress loop runs — otherwise a full stderr pipe (ffmpeg banner +
+        # error spam) blocks ffmpeg forever and wait() below never returns.
+        stderr_chunks: list[str] = []
+
+        def _drain_stderr() -> None:
+            try:
+                if process.stderr is not None:
+                    stderr_chunks.append(process.stderr.read())
+            except (OSError, ValueError):
+                pass
+
+        stderr_thread = threading.Thread(
+            target=_drain_stderr, daemon=True, name="av1-stderr-drain"
+        )
+        if process.stderr is not None:
+            stderr_thread.start()
         for line in process.stdout:
             if self._cancel_event.is_set():
                 process.terminate()
@@ -228,8 +262,23 @@ class Av1EncoderQueue:
             if ratio is not None:
                 job.progress = ratio
                 self._progress_cb(job, ratio)
-        process.wait(timeout=60)
-        stderr_tail = (process.stderr.read() if process.stderr else "")[-500:]
+        try:
+            process.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+            job.status = JobStatus.FAILED
+            job.error = "ffmpeg did not finish within 60 s and was killed"
+            job.finished_at = time.time()
+            temp_target.unlink(missing_ok=True)
+            self._save_state()
+            return
+        if stderr_thread.is_alive():
+            stderr_thread.join(timeout=5)
+        stderr_tail = "".join(stderr_chunks)[-500:]
         if process.returncode != 0:
             job.status = JobStatus.FAILED
             job.error = f"ffmpeg exit {process.returncode}: {stderr_tail}"

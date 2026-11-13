@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from episodematch.core.exceptions import ProviderError
@@ -302,7 +304,7 @@ class TestPipelineWithDiscUrl:
         report = pipeline.scan_folder(
             _ensure_rips(tmp_path),
             series="Test Show",
-            season=6,  # wrong season on purpose: the URL must win over the heuristic
+            season=1,  # matches the fixture disc; the URL still pins the loaded disc
             options=ScanOptions(
                 depth="fast",
                 discdb_url="https://thediscdb.com/series/test-show-2020/releases/season-1/discs/blu-ray",
@@ -313,6 +315,35 @@ class TestPipelineWithDiscUrl:
         assert entry.episode == 1
         evidence = next(e for e in entry.evidence if e.pillar.value == "disc_db")
         assert evidence.details["source"].startswith("https://thediscdb.com/")
+        assert evidence.season_hint == 1
+
+    def test_url_scan_still_pins_loading_when_season_heuristic_misses(self, tmp_path, config, thediscdb_repo) -> None:
+        """The URL must pin the *loading* regardless of the requested season
+        (audit A1 keeps this) — but cross-season evidence is now gated at the
+        evidence level, so nothing is assigned for the wrong season."""
+        from episodematch.matcher.pipeline import Pipeline, ScanOptions
+
+        mkv = make_mkv("title_t00.mkv", mpls="00800.mpls", duration=42 * 60 + 30, size=2_028_000_000)
+        pipeline = Pipeline(
+            config,
+            ffprobe=FakeFfprobe({"title_t00.mkv": mkv}),
+            disc_db_client=LocalDiscDbImporter(thediscdb_repo),
+            tmdb=FakeTmdb(make_guide()),
+        )
+        report = pipeline.scan_folder(
+            _ensure_rips(tmp_path),
+            series="Test Show",
+            season=6,  # wrong season on purpose
+            options=ScanOptions(
+                depth="fast",
+                discdb_url="https://thediscdb.com/series/test-show-2020/releases/season-1/discs/blu-ray",
+            ),
+        )
+        disc_evidence = [
+            ev for c in report.candidates for ev in c.evidence if ev.pillar.value == "disc_db"
+        ]
+        assert disc_evidence == []  # season mismatch -> no evidence, no assignment
+        assert report.assignment.assigned_count == 0
 
 
 def _ensure_rips(tmp_path):
@@ -322,3 +353,76 @@ def _ensure_rips(tmp_path):
     folder.mkdir(exist_ok=True)
     (folder / "title_t00.mkv").write_bytes(b"\x1a\x45\xdf\xa3fake")
     return folder
+
+
+class TestSeasonMismatchGuard:
+    """Audit A1: DiscDB evidence for a *different* season must never become
+    evidence for the requested season (S02E01 rip was assigned as S01E01 @ 1.0)."""
+
+    def test_disc_evidence_for_other_season_is_ignored(self, tmp_path, config):
+        from episodematch.matcher.pipeline import Pipeline, ScanOptions
+        from episodematch.providers.thediscdb import LocalDiscDbImporter
+        from tests.test_pipeline import FakeFfprobe, FakeTmdb, make_guide
+
+        release_dir = tmp_path / "discdb" / "data" / "series" / "Test Show (2020)" / "season-2"
+        release_dir.mkdir(parents=True)
+        disc_payload = {
+            "Name": "Season Two Disc One", "Slug": "blu-ray-1", "Format": "Blu-Ray",
+            "Titles": [{
+                "Index": 0, "SourceFile": "00901.mpls", "Duration": "0:42:30",
+                "Size": 2028000000,
+                "Item": {"Title": "Season Two Opener", "Type": "Episode",
+                         "Season": "2", "Episode": "1"},
+            }],
+        }
+        (release_dir / "disc01.json").write_text(json.dumps(disc_payload), encoding="utf-8")
+
+        mkv = make_mkv("title_t00.mkv", mpls="00901.mpls", duration=42 * 60 + 30, size=2028000000)
+        pipeline = Pipeline(
+            config,
+            ffprobe=FakeFfprobe({"title_t00.mkv": mkv}),
+            disc_db_client=LocalDiscDbImporter(tmp_path / "discdb"),
+            tmdb=FakeTmdb(make_guide()),
+        )
+        report = pipeline.scan_folder(
+            _ensure_rips(tmp_path),
+            series="Test Show",
+            season=1,  # requested season does NOT match the disc entry (S02)
+            options=ScanOptions(
+                depth="fast",
+                discdb_url="https://thediscdb.com/series/test-show-2020/releases/season-2",
+            ),
+        )
+        assignment = report.assignment
+        assert assignment.assigned_count == 0  # no cross-season assignment
+        disc_evidence = [
+            ev for c in report.candidates for ev in c.evidence if ev.pillar.value == "disc_db"
+        ]
+        assert disc_evidence == []  # cross-season evidence must not be recorded
+        messages = " | ".join(r.detail for r in report.pillar_reports if r.pillar == "disc_db")
+        assert "Season 2" in messages and "ignored" in messages
+
+
+class TestMplsVsIndexPinned:
+    """Audit A2: with a pinned disc URL, a contradicting title index must not
+    outrank an exact MPLS identity match (wrong E2 entry beat the correct E1
+    entry at 1.0 vs 0.95)."""
+
+    def test_contradicting_index_loses_to_exact_mpls(self) -> None:
+        from episodematch.core.models import MkvFile
+        from episodematch.providers.thediscdb import match_fingerprint, parse_disc_json
+
+        payload = {"Name": "D", "Slug": "d", "Format": "Blu-Ray", "Titles": [
+            {"Index": 2, "SourceFile": "00002.mpls", "Duration": "0:16:40", "Size": 1000,
+             "Item": {"Title": "Wrong", "Type": "Episode", "Season": "1", "Episode": "2"}},
+            {"Index": 1, "SourceFile": "00001.mpls", "Duration": "0:16:40", "Size": 1000,
+             "Item": {"Title": "Right", "Type": "Episode", "Season": "1", "Episode": "1"}}]}
+        disc = parse_disc_json(payload, series_title="X", release_title="r", source="t")
+        mkv = MkvFile(path="D:/x/title_t02.mkv", size_bytes=1000, duration_seconds=1000.0,
+                      title_tag="00001.mpls", source_id="00001.mpls")
+        fp = DiscFingerprint.from_mkv(mkv)
+        matches = match_fingerprint(fp, [disc], index_weight=0.90)
+        assert matches[0].entry.episode == 1  # exact MPLS identity wins
+        assert "MPLS 00001.mpls matches disc entry" in " ".join(matches[0].reasons)
+        # the contradicting index match was ignored entirely
+        assert all("title index" not in r for m in matches for r in m.reasons)

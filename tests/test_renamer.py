@@ -10,7 +10,7 @@ import pytest
 from episodematch.core.config import format_episode_name, sanitize_filename
 from episodematch.core.exceptions import RenameError
 from episodematch.core.models import AssignmentEntry
-from episodematch.postprocess.renamer import (
+from episodematch.postprocess.renamer import (  # noqa: F401 - repoint_entries used below
     RenamePlan,
     RenamePlanItem,
     Renamer,
@@ -264,3 +264,94 @@ class TestUndo:
         renamer.undo_latest()
         assert (rips / "title_t00.mkv").is_file()
         assert (rips / "title_t01.mkv").is_file()
+
+
+class TestPartialFailureSafety:
+    """Audit B1: a mid-batch failure must leave a journal for the renames that
+    already happened, and every planned temp target must be validated up-front."""
+
+    def test_validate_rejects_stale_temp_targets(self, rips, tmp_path) -> None:
+        plan = build_rename_plan(
+            [entry(rips, "title_t01.mkv", 1, 2, "Second")],
+            series="Show", template="{series} - S{season:02d}E{episode:02d} - {title}", dry_run=False,
+        )
+        stale = plan.items[0].destination.with_name(
+            f".{plan.items[0].destination.stem}.emtmp{plan.items[0].destination.suffix}"
+        )
+        stale.write_bytes(b"stale")
+        renamer = Renamer(tmp_path / "undo")
+        with pytest.raises(RenameError, match="Temporary rename target"):
+            renamer.apply(plan)
+        assert (rips / "title_t01.mkv").is_file()  # nothing renamed
+        assert renamer.list_journals() == []  # fail-fast before any rename
+
+    def test_mid_batch_failure_keeps_incremental_journal(self, rips, tmp_path, monkeypatch) -> None:
+        plan = build_rename_plan(
+            [entry(rips, "title_t00.mkv", 1, 1, "Pilot"), entry(rips, "title_t01.mkv", 1, 2, "Second")],
+            series="Show", template="{series} - S{season:02d}E{episode:02d} - {title}", dry_run=False,
+        )
+        renamer = Renamer(tmp_path / "undo")
+
+        real_rename = Path.rename
+        calls = {"n": 0}
+
+        def flaky(self, target, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 3:  # item 2: source -> temp
+                raise OSError(39, "simulated mid-batch failure")
+            return real_rename(self, target, **kwargs)
+
+        monkeypatch.setattr(Path, "rename", flaky)
+
+        with pytest.raises(RenameError):
+            renamer.apply(plan)
+
+        journals = renamer.list_journals()
+        assert len(journals) == 1  # incremental journal survives the failure
+        payload = json.loads(journals[0].read_text(encoding="utf-8"))
+        assert len(payload["operations"]) == 1  # item 1 is undoable
+        renamer.undo_latest()
+        assert (rips / "title_t00.mkv").is_file()  # restored
+        assert not (rips / "Show - S01E01 - Pilot.mkv").exists()
+
+class TestRepointEntries:
+    """Audit B4: after applying renames, the solved entries must point at the
+    NEW paths, so a following `--tag` (mkvpropedit) tags the renamed files."""
+
+    def test_repoint_updates_file_paths(self, tmp_path: Path) -> None:
+        from episodematch.postprocess.renamer import RenamePlanItem, repoint_entries
+
+        entries = [
+            entry(tmp_path, "title_t00.mkv", 1, 1, "Pilot"),
+            entry(tmp_path, "title_t01.mkv", 1, 2, "Second"),
+        ]
+        applied = [
+            RenamePlanItem(source=tmp_path / "title_t00.mkv", destination=tmp_path / "S01E01 - Pilot.mkv"),
+            RenamePlanItem(source=tmp_path / "title_t01.mkv", destination=tmp_path / "S01E02 - Second.mkv"),
+        ]
+        repointed = repoint_entries(entries, applied)
+        assert entries[0].file_path == tmp_path / "S01E01 - Pilot.mkv"
+        assert entries[1].file_path == tmp_path / "S01E02 - Second.mkv"
+        assert repointed == 2
+
+    def test_repoint_ignores_unrelated_entries(self, tmp_path: Path) -> None:
+        from episodematch.postprocess.renamer import RenamePlanItem, repoint_entries
+
+        entries = [entry(tmp_path, "title_t00.mkv", 1, 1, "Pilot")]
+        applied = [
+            RenamePlanItem(source=tmp_path / "other.mkv", destination=tmp_path / "Other.mkv"),
+        ]
+        repointed = repoint_entries(entries, applied)
+        assert entries[0].file_path == tmp_path / "title_t00.mkv"
+        assert repointed == 0
+
+    def test_repoint_skips_noop_renames(self, tmp_path: Path) -> None:
+        from episodematch.postprocess.renamer import RenamePlanItem, repoint_entries
+
+        entries = [entry(tmp_path, "same.mkv", 1, 1, "Same")]
+        applied = [
+            RenamePlanItem(source=tmp_path / "same.mkv", destination=tmp_path / "same.mkv"),
+        ]
+        repointed = repoint_entries(entries, applied)
+        assert entries[0].file_path == tmp_path / "same.mkv"
+        assert repointed == 0

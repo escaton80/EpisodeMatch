@@ -19,6 +19,7 @@ from episodematch.core.models import (
     Transcript,
 )
 from episodematch.matcher.text_scorer import score_episode
+from episodematch.core.exceptions import ProviderError
 from episodematch.providers.opensubtitles import OpenSubtitlesClient
 
 
@@ -490,3 +491,68 @@ class TestPipelineLanguageChain:
         fake_osdt = FakeOpenSubtitlesByLanguage({"de": _transcript_with_language("de", _DIALOG)})
         self._run(tmp_path, fake_osdt, transcript_language=None)
         assert fake_osdt.requested == ["de", "de"]  # stops at the first hit per episode
+
+class TestOpenSubtitlesMalformedJson:
+    """Audit B6: a 200 response with a non-JSON body must raise ProviderError
+    instead of an unhandled json.JSONDecodeError."""
+
+    def test_get_with_html_body_raises_provider_error(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, text="<html>Oops, something went wrong</html>")
+
+        client = _make_client(handler)
+        with pytest.raises(ProviderError, match="not JSON"):
+            client._get("/api/v1/subtitles", {"query": "x"})
+
+class TestOpenSubtitlesQuotaVsCache:
+    """Audit E2: the daily-quota block only limits the /download endpoint —
+    an already-cached SRT must stay usable after a 406."""
+
+    def _osdt_entry(self, sub_id: str, language: str) -> dict[str, Any]:
+        return {
+            "id": sub_id,
+            "attributes": {"language": language, "download_count": 10, "files": [{"file_id": 42}]},
+        }
+
+    def test_quota_blocked_client_still_returns_cached_srt(self, tmp_path: Path) -> None:
+        import time as _time
+
+        from episodematch.core.database import CacheDatabase
+        from episodematch.core.models import SubtitleLine
+
+        srt_path = tmp_path / "cached.srt"
+        srt_path.write_bytes(_SRT_BYTES)
+        cache = CacheDatabase(tmp_path / "cache.sqlite3")
+        cache.put_osdb_subtitle("osdt-de", {"file_id": "42", "release": "r"}, srt_path)
+
+        download_calls: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            path = httpx.URL(request.url).path
+            if path == "/api/v1/subtitles":
+                return httpx.Response(200, json={"data": [self._osdt_entry("osdt-de", "de")]})
+            download_calls.append(str(request.url))
+            return httpx.Response(406, text="Download limit reached (5 per day) (2026-11-14 03:00:00 UTC)")
+
+        client = _make_client(handler)
+        client._cache = cache
+        client._quota_blocked_until = _time.time() + 3600  # quota exhausted
+
+        transcript = client.reference_transcript(tmdb_id=1, season=1, episode=2, languages="de")
+        assert transcript is not None  # served from cache despite the quota block
+        assert transcript.lines  # parsed SRT content
+        assert download_calls == []  # /download never touched
+
+    def test_quota_blocked_without_cache_returns_none(self, tmp_path: Path) -> None:
+        import time as _time
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            path = httpx.URL(request.url).path
+            if path == "/api/v1/subtitles":
+                return httpx.Response(200, json={"data": [self._osdt_entry("osdt-de", "de")]})
+            return httpx.Response(406, text="Download limit reached")
+
+        client = _make_client(handler)
+        client._quota_blocked_until = _time.time() + 3600
+        transcript = client.reference_transcript(tmdb_id=1, season=1, episode=2, languages="de")
+        assert transcript is None  # nothing cached, quota honored

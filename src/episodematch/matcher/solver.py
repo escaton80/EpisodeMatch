@@ -185,9 +185,14 @@ def solve_assignment(
 
     raw_matrix = build_score_matrix(candidates, episode_numbers)
     finite = np.nan_to_num(raw_matrix, nan=0.0, posinf=0.0, neginf=0.0)
-    # Minimize costs: negate scores and shift to positive range.
-    max_score = float(finite.max()) or 1.0
-    cost_matrix = (max_score - finite).tolist()
+    # Audit A3: the confidence threshold is part of the assignment problem.
+    # Sub-threshold cells are inadmissible — they must not shape the global
+    # assignment (otherwise the optimizer prefers two 0.54 cells over one
+    # feasible 0.90 match and discards everything). The raw matrix is kept for
+    # best-guess reporting.
+    assignable = np.where(finite >= min_confidence, finite, 0.0)
+    max_score = float(assignable.max()) or 1.0
+    cost_matrix = (max_score - assignable).tolist()
 
     try:
         row_ind, col_ind, method = solve_assignment_costs(cost_matrix)
@@ -198,17 +203,16 @@ def solve_assignment(
     assigned_rows: set[int] = set()
     for row, col in zip(row_ind, col_ind):
         assigned_rows.add(row)
-        score = float(finite[row, col])
+        score = float(assignable[row, col])
         candidate = candidates[row]
         episode = episode_numbers[col]
         if score < min_confidence:
+            # The optimizer assigned an inadmissible (zeroed) cell — nothing
+            # usable for this file.
             solved.unassigned.append(
                 UnassignedFile(
                     file_path=candidate.file_path,
-                    reason=(
-                        f"Best assignment S{season:02d}E{episode:02d} has only {score:.2f} confidence "
-                        f"(below {min_confidence:.2f} threshold)"
-                    ),
+                    reason="No admissible match above the confidence threshold",
                     best_guess_episode=episode,
                     best_guess_confidence=score,
                 )
@@ -229,21 +233,29 @@ def solve_assignment(
         )
         solved.total_score += score
 
-    # Files whose best cell was not chosen by the solver (lost conflicts).
+    # Files whose best cell was not chosen by the solver (lost conflicts). The
+    # best guess is reported from the RAW matrix, so a sub-threshold best match
+    # is still visible to the user.
     for row, candidate in enumerate(candidates):
         if row in assigned_rows:
             continue
         best_col = int(np.argmax(finite[row])) if finite.shape[1] else -1
         best_score = float(finite[row, best_col]) if best_col >= 0 else 0.0
         best_episode = episode_numbers[best_col] if best_col >= 0 else None
+        below = best_score < min_confidence
         solved.unassigned.append(
             UnassignedFile(
                 file_path=candidate.file_path,
                 reason=(
                     f"Lost the global assignment conflict "
                     f"(best episode S{season:02d}E{best_episode:02d} at {best_score:.2f})"
-                    if best_episode is not None
-                    else "No episodes available"
+                    if best_episode is not None and not below
+                    else (
+                        f"Best guess S{season:02d}E{best_episode:02d} at {best_score:.2f} "
+                        f"is below the confidence threshold"
+                        if best_episode is not None
+                        else "No episodes available"
+                    )
                 ),
                 best_guess_episode=best_episode,
                 best_guess_confidence=best_score,

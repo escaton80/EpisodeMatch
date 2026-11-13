@@ -16,9 +16,11 @@ import pytest
 
 pyside = pytest.importorskip("PySide6", reason="PySide6 not installed (pip install -e .[gui])")
 
+from PySide6.QtCore import QThread  # noqa: E402
 from PySide6.QtWidgets import QApplication, QProgressBar, QLabel  # noqa: E402
 
 from episodematch.core.config import AppConfig  # noqa: E402
+from episodematch.core.database import CacheDatabase  # noqa: E402
 from episodematch.core.models import (  # noqa: E402
     AssignmentEntry,
     Evidence,
@@ -29,6 +31,7 @@ from episodematch.core.models import (  # noqa: E402
 )
 from episodematch.matcher.pipeline import ScanReport  # noqa: E402
 from episodematch.ui.context import AppContext  # noqa: E402
+from episodematch.ui import main_window as main_window_module  # noqa: E402
 from episodematch.ui.main_window import FluentWindow, create_app_context  # noqa: E402
 from episodematch.ui.theme import Palette, build_qss  # noqa: E402
 from episodematch.ui.views.postprocess_view import PostprocessView  # noqa: E402
@@ -357,6 +360,21 @@ class TestPostprocessView:
         assert view._queue_table.item(0, 2).text() == "pending"
         assert isinstance(view._queue_table.cellWidget(0, 3), QProgressBar)
 
+    def test_add_folder_skips_existing_outputs(self, qapp: QApplication, ui_context: AppContext, tmp_path: Path) -> None:
+        """Audit B3: files whose .av1.mkv output already exists are not queued
+        again (re-encoding would silently overwrite the finished file)."""
+        folder = tmp_path / "done"
+        folder.mkdir()
+        (folder / "ep1.mkv").write_bytes(b"x")
+        (folder / "ep1.av1.mkv").write_bytes(b"finished encode")  # output exists
+        (folder / "ep2.mkv").write_bytes(b"x")  # no output yet
+        view = PostprocessView(ui_context)
+        view._folder_edit.setText(str(folder))
+        view._on_add_folder()
+        assert view._queue_table.rowCount() == 1
+        assert view._queue_table.item(0, 0).text().endswith("ep2.mkv")
+        assert "1 file(s) queued" in view._banner.text() if view._banner.isVisible() else True
+
 
 class TestSettingsView:
     def test_load_and_save_roundtrip(self, qapp: QApplication, ui_context: AppContext) -> None:
@@ -480,3 +498,84 @@ class TestFluentWindow:
         )
         assert code == 0
         assert ConfigStore(tmp_path / "data" / "config.json").path == tmp_path / "data" / "config.json"
+
+class _StubWorker(QThread):
+    """A worker that ignores cancel() and finishes after `duration` seconds."""
+
+    def __init__(self, duration: float = 0.3) -> None:
+        super().__init__()
+        self._duration = duration
+
+    def cancel(self) -> None:
+        pass  # deliberately ignores the cancellation handshake (worst case)
+
+    def run(self) -> None:
+        import time
+
+        time.sleep(self._duration)
+
+
+class TestShutdownHandshake:
+    """Audit D2: the shared cache database must not close under live workers."""
+
+    def _window_with_db(self, qapp: QApplication, ui_context: AppContext, tmp_path: Path) -> FluentWindow:
+        ui_context.database = CacheDatabase(tmp_path / "cache.sqlite3")
+        win = FluentWindow(ui_context)
+        win.show()
+        qapp.processEvents()
+        return win
+
+    def test_views_busy_reflects_running_worker(self, qapp: QApplication, ui_context: AppContext, tmp_path: Path) -> None:
+        win = self._window_with_db(qapp, ui_context, tmp_path)
+        try:
+            assert win._views_busy() is False
+            worker = _StubWorker(duration=0.2)
+            win._workspace._scan_worker = worker
+            worker.start()
+            qapp.processEvents()
+            assert win._views_busy() is True
+            worker.wait(2000)
+            assert win._views_busy() is False
+        finally:
+            win.close()
+
+    def test_close_waits_until_views_idle_then_closes_db(self, qapp: QApplication, ui_context: AppContext, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        win = self._window_with_db(qapp, ui_context, tmp_path)
+        worker = _StubWorker(duration=0.2)  # ignores cancel(); finishes on its own
+        win._workspace._scan_worker = worker
+        worker.start()
+        qapp.processEvents()
+        monkeypatch.setattr(main_window_module, "_confirm_close_while_busy", lambda parent: "wait")
+        try:
+            win.close()
+            qapp.processEvents()
+            assert ui_context.database.is_closed  # closed only AFTER the worker ended
+            assert not worker.isRunning()
+        except Exception:
+            worker.wait(3000)
+            raise
+
+    def test_close_anyway_closes_db_immediately(self, qapp: QApplication, ui_context: AppContext, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        win = self._window_with_db(qapp, ui_context, tmp_path)
+        worker = _StubWorker(duration=1.5)  # keeps running past the close
+        win._workspace._scan_worker = worker
+        worker.start()
+        qapp.processEvents()
+        monkeypatch.setattr(main_window_module, "_confirm_close_while_busy", lambda parent: "close")
+        try:
+            win.close()
+            qapp.processEvents()
+            assert ui_context.database.is_closed  # user chose to close anyway
+        finally:
+            worker.wait(4000)
+
+    def test_idle_close_never_asks(self, qapp: QApplication, ui_context: AppContext, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        win = self._window_with_db(qapp, ui_context, tmp_path)
+        monkeypatch.setattr(
+            main_window_module,
+            "_confirm_close_while_busy",
+            lambda parent: (_ for _ in ()).throw(AssertionError("dialog must not open for an idle window")),
+        )
+        win.close()
+        qapp.processEvents()
+        assert ui_context.database.is_closed

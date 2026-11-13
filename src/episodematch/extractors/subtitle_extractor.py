@@ -26,6 +26,7 @@ from episodematch.extractors.ocr_engine import OcrEngine, prepare_for_ocr
 from episodematch.extractors.pgs_parser import (
     PgsEvent,
     PgsSupParser,
+    compute_window_ranges,
     filter_events_window,
 )
 
@@ -522,7 +523,15 @@ class SubtitleExtractor:
                 )
             try:
                 parser = PgsSupParser()
-                events = parser.parse_file(sup_path)
+                # Audit C4: restrict RLE decoding to the scan window up front —
+                # a full-film .sup otherwise decodes every event bitmap before
+                # the cap applies.
+                pts_windows = (
+                    compute_window_ranges(duration_seconds=duration_seconds, window_minutes=window_minutes)
+                    if window_minutes is not None and duration_seconds
+                    else None
+                )
+                events = parser.parse_file(sup_path, pts_windows=pts_windows)
             finally:
                 if not self._keep_temp_files:
                     sup_path.unlink(missing_ok=True)

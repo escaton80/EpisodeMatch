@@ -140,7 +140,8 @@ class TestSolveAssignment:
         solved = solve_assignment(candidates, [1], season=1, min_confidence=0.55)
         assert solved.entries == []
         assert len(solved.unassigned) == 1
-        assert "below" in solved.unassigned[0].reason
+        # Audit A3: the reason wording changed — the cell is inadmissible now.
+        assert "No admissible match above the confidence threshold" in solved.unassigned[0].reason
         assert solved.unassigned[0].best_guess_episode == 1
 
     def test_reasoning_and_evidence_attached(self) -> None:
@@ -180,10 +181,11 @@ class TestBuildScoreMatrix:
         candidate_b = MatchCandidate(file_path="D:/rips/b.mkv")
         matrix = build_score_matrix([candidate_a, candidate_b], [1, 2, 3])
         assert matrix.shape == (2, 3)
-        # Evidence contributions are squared: 0.5 -> 0.25, 0.8 -> 0.64.
-        assert matrix[0, 0] == pytest.approx(0.25)
+        # Audit A4: calibrated aggregation - strongest evidence per pillar,
+        # no squaring (0.5 stays 0.5, 0.8 stays 0.8).
+        assert matrix[0, 0] == pytest.approx(0.5)
         assert matrix[0, 1] == 0.0
-        assert matrix[0, 2] == pytest.approx(0.64)
+        assert matrix[0, 2] == pytest.approx(0.8)
         assert matrix[1].sum() == 0.0
 
     def test_squared_evidence_aggregation(self) -> None:
@@ -193,3 +195,32 @@ class TestBuildScoreMatrix:
             candidate_obj.add_evidence(Evidence(pillar=Pillar.SUBTITLE, kind="t", score=0.5, summary="x", episode_hint=1))
         matrix = build_score_matrix([candidate_obj], [1])
         assert matrix[0, 0] == pytest.approx(0.5)
+
+
+class TestThresholdBeforeOptimization:
+    def test_threshold_applied_before_optimization(self) -> None:
+        """Audit A3: the confidence threshold must be part of the assignment
+        problem. Otherwise the optimizer prefers two inadmissible 0.54 cells
+        over one feasible 0.90 match and discards everything."""
+        a = MatchCandidate(file_path="D:/x/a.mkv")
+        a.episode_scores[1] = 0.54
+        b = MatchCandidate(file_path="D:/x/b.mkv")
+        b.episode_scores[1] = 0.90
+        b.episode_scores[2] = 0.54
+        solved = solve_assignment([a, b], [1, 2], season=1, min_confidence=0.55)
+        assert len(solved.entries) == 1
+        assert solved.entries[0].file_path.name == "b.mkv"
+        assert solved.entries[0].episode == 1
+        assert solved.entries[0].confidence == pytest.approx(0.90)
+        assert len(solved.unassigned) == 1  # a: no admissible cell left
+
+
+class TestUniqueDurationCalibration:
+    def test_unique_duration_disc_evidence_is_assigned(self) -> None:
+        """Audit A4(c): the DiscDB 'unique duration' signal (0.70) is
+        near-conclusive and must not be diluted below the solver threshold."""
+        c = MatchCandidate(file_path="D:/x/t06.mkv")
+        c.add_evidence(Evidence(pillar=Pillar.DISC_DB, kind="f", score=0.70, summary="unique on disc", episode_hint=6))
+        solved = solve_assignment([c], [6], season=1, min_confidence=0.55)
+        assert len(solved.entries) == 1
+        assert solved.entries[0].confidence == pytest.approx(0.70)

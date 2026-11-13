@@ -412,3 +412,8 @@ class SettingsView(QWidget):
         for worker in (self._fetch_worker, getattr(self, "_llm_test_worker", None)):
             if worker is not None and worker.isRunning():
                 worker.wait(1500)
+
+    def is_busy(self) -> bool:
+        """True while any worker thread is still alive (audit D2 handshake)."""
+        workers = (self._fetch_worker, getattr(self, "_llm_test_worker", None))
+        return any(worker is not None and worker.isRunning() for worker in workers)

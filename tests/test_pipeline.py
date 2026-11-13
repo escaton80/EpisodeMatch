@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 from episodematch.core.config import AppConfig
@@ -29,6 +30,7 @@ from episodematch.core.models import (
 )
 from episodematch.extractors.ffprobe_reader import FfprobeReader
 from episodematch.extractors.subtitle_extractor import SubtitleExtractor
+from episodematch.core.exceptions import LlmError
 from episodematch.matcher.llm_arbiter import LlmArbiter, LlmSettings
 from episodematch.matcher.pipeline import Pipeline, ScanOptions
 from episodematch.providers.thediscdb import LocalDiscDbImporter
@@ -452,3 +454,100 @@ class TestLlmConnectionTest:
 
         ok, message = test_connection(LlmSettings(api_key=""))
         assert ok is False and "No API key" in message
+
+class TestLlmMalformedJson:
+    """Audit B6: a 200 response with a non-JSON body must raise LlmError so the
+    arbiter's retry loop can catch it — a raw JSONDecodeError escapes retries."""
+
+    def test_chat_with_html_body_raises_llm_error(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, text="<html>gateway error page</html>")
+
+        arbiter = LlmArbiter(
+            LlmSettings(api_key="test-key"),
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+        with pytest.raises(LlmError, match="not JSON"):
+            arbiter._chat("some prompt")
+
+class _FakeResolver:
+    """A ToolResolver stub so service construction works without binaries."""
+
+    def tool_path(self, name: str) -> Path:
+        return Path("D:/fake/bin") / name
+
+    def find(self, name: str) -> Any:
+        from episodematch.core.models import ToolInfo, ToolStatus
+
+        return ToolInfo(
+            name=name,
+            status=ToolStatus.MISSING,
+            path=Path("D:/fake/bin") / name,
+            version=None,
+        )
+
+
+class TestScanWindowConfigPlumbing:
+    """Audit F4: the pipeline must pass ExtractionSettings windows into the
+    AudioSnipper/FrameScanner it constructs."""
+
+    def _config(self, tmp_path: Path) -> AppConfig:
+        from episodematch.core.config import ExtractionSettings
+
+        return AppConfig(
+            bin_dir=tmp_path / "bin",
+            data_dir=tmp_path / "data",
+            extraction=ExtractionSettings(
+                audio_window_1_start_min=0.5,
+                audio_window_1_end_min=1.0,
+                audio_window_2_minutes_before_end=1.5,
+                audio_window_2_length_min=0.75,
+                title_card_window_minutes=2.5,
+            ),
+        )
+
+    def test_audio_service_receives_configured_windows(self, tmp_path: Path) -> None:
+        pipeline = build_pipeline(self._config(tmp_path))
+        pipeline._resolver = _FakeResolver()
+        snipper = pipeline._audio_service()
+        assert snipper.window_1_start == pytest.approx(30.0)  # 0.5 min -> seconds
+        assert snipper.window_1_end == pytest.approx(60.0)
+        assert snipper.minutes_before_end == pytest.approx(90.0)
+        assert snipper.window_2_length == pytest.approx(45.0)
+
+    def test_visual_service_receives_configured_title_window(self, tmp_path: Path) -> None:
+        from tests.conftest import FakeOcrBackend
+
+        pipeline = build_pipeline(self._config(tmp_path))
+        pipeline._ocr = FakeOcrBackend([])
+        pipeline._resolver = _FakeResolver()
+        scanner = pipeline._visual_service()
+        assert scanner.title_card_minutes == pytest.approx(2.5)
+
+class TestSeasonRangeReleaseMatching:
+    """Audit F5: multi-season boxes ("seasons-6-10-blu-ray") must match any
+    season inside the range, not only their first season."""
+
+    class _FakeClient:
+        def __init__(self, folders: list[str]) -> None:
+            self._folders = folders
+
+        def list_releases(self, series_folder: str) -> list[str]:
+            return list(self._folders)
+
+    def test_season_inside_range_matches(self) -> None:
+        client = self._FakeClient(["season-6-blu-ray", "seasons-6-10-blu-ray", "season-12-blu-ray"])
+        assert Pipeline._disc_release_folders(client, "south-park-1997", 8) == ["seasons-6-10-blu-ray"]
+
+    def test_range_boundaries_match(self) -> None:
+        client = self._FakeClient(["seasons-6-10-blu-ray"])
+        assert Pipeline._disc_release_folders(client, "x", 6) == ["seasons-6-10-blu-ray"]
+        assert Pipeline._disc_release_folders(client, "x", 10) == ["seasons-6-10-blu-ray"]
+
+    def test_season_outside_range_does_not_match(self) -> None:
+        client = self._FakeClient(["seasons-6-10-blu-ray", "season-12-blu-ray"])
+        assert Pipeline._disc_release_folders(client, "x", 12) == ["season-12-blu-ray"]
+
+    def test_no_match_falls_back_to_all_folders(self) -> None:
+        client = self._FakeClient(["complete-series-blu-ray"])
+        assert Pipeline._disc_release_folders(client, "x", 8) == ["complete-series-blu-ray"]

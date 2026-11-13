@@ -385,13 +385,23 @@ class PostprocessView(QWidget):
         if folder is None or not folder.is_dir():
             return
         self._folder_edit.setText(str(folder))
+        # Audit B3: skip files whose encoded output already exists — re-queueing
+        # them would silently overwrite finished encodes at the final replace().
         count = 0
+        skipped = 0
         for path in sorted(folder.glob("*.mkv")):
             if path.stem.endswith(".av1"):
                 continue
-            self._append_queue_row(path, path.with_name(path.stem + ".av1.mkv"))
+            destination = path.with_name(path.stem + ".av1.mkv")
+            if destination.exists():
+                skipped += 1
+                continue
+            self._append_queue_row(path, destination)
             count += 1
-        self._show_banner("info", f"{count} file(s) queued for AV1 encoding.")
+        if skipped:
+            self._show_banner("info", f"{count} file(s) queued — {skipped} skipped (output already exists).")
+        else:
+            self._show_banner("info", f"{count} file(s) queued for AV1 encoding.")
 
     def _append_queue_row(self, source: Path, destination: Path) -> int:
         row = self._queue_table.rowCount()
@@ -494,3 +504,8 @@ class PostprocessView(QWidget):
                 if hasattr(worker, "cancel"):
                     worker.cancel()
                 worker.wait(1500)
+
+    def is_busy(self) -> bool:
+        """True while any worker thread is still alive (audit D2 handshake)."""
+        workers = (self._analyze_worker, self._clean_worker, self._encode_worker)
+        return any(worker is not None and worker.isRunning() for worker in workers)

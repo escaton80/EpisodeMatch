@@ -169,15 +169,15 @@ def find_project_root(start: Path | None = None) -> Path | None:
 
 
 def _dev_anchor() -> Path | None:
-    """Project root when running from a source checkout (venv included).
+    """Path root for relative ``bin``/``data`` resolution.
 
-    Detects the checkout via ``sys.prefix`` (the venv directory in development,
-    the bundle directory in frozen builds) and disables itself for frozen
-    executables, whose documented behavior is CWD-relative (a copied ``dist``
-    folder carries its own ``bin``/``data``).
+    Source checkout: the project root (found via ``sys.prefix``). Frozen build
+    (audit F2): the directory of the running executable — a shortcut launched
+    from an arbitrary CWD must not fork tools/configuration/cache into that
+    directory.
     """
     if getattr(sys, "frozen", False):
-        return None
+        return Path(sys.executable).resolve().parent
     prefix = Path(sys.prefix).resolve()
     for candidate in (prefix, *prefix.parents):
         if (candidate / "pyproject.toml").is_file():
@@ -189,14 +189,18 @@ def _resolve_relative(path: Path) -> Path:
     """Resolve a relative path; the dev checkout outranks the CWD.
 
     Development (venv/checkout): the project root's ``bin``/``data`` are used
-    even when the CWD contains same-named folders — this keeps double-clicked
-    shims and accidental CWDs from silently forking the configuration and cache.
-    Frozen executables: plain CWD-relative resolution (portable dist layout).
+    even when the CWD contains same-named folders. Frozen executables (audit
+    F2): anchored at the EXE directory, so shortcuts from any CWD keep using
+    the portable dist folder's ``bin``/``data``.
     """
     anchor = _dev_anchor()
     if anchor is not None:
         from_anchor = anchor / path
         if from_anchor.exists():
+            return from_anchor
+        if getattr(sys, "frozen", False):
+            # Audit F2: frozen builds never fall back to the launch CWD —
+            # that is exactly the silent tools/config fork a shortcut causes.
             return from_anchor
     from_cwd = Path.cwd() / path
     if from_cwd.exists():
@@ -309,7 +313,9 @@ class AppConfig(BaseModel):
     def masked(self) -> dict[str, Any]:
         """Dict representation with API keys masked (for logging/UI)."""
         data = self.model_dump(mode="json")
-        for key in ("tmdb_api_key", "opensubtitles_api_key", "llm_api_key"):
+        # Audit F1: every credential field must be listed here — a new key
+        # field without an entry in this tuple leaks verbatim in logs/UI.
+        for key in ("tmdb_api_key", "opensubtitles_api_key", "subdl_api_key", "llm_api_key"):
             value = data.get(key) or ""
             data[key] = (value[:4] + "…" + value[-2:]) if len(value) > 8 else ("set" if value else "")
         return data

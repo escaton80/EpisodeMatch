@@ -230,10 +230,17 @@ class StreamCleaner:
 
     @staticmethod
     def _swap(original: Path, remuxed: Path) -> None:
-        """Replace the original with the remuxed file, keeping a .bak."""
+        """Replace the original with the remuxed file, keeping a .bak.
+
+        Audit B2: an existing ``.bak`` is rotated to ``.bak.old`` instead of
+        being destroyed, so the pre-cleanup state of the previous swap is never
+        lost (e.g. when the user re-runs cleanup after a first pass).
+        """
         backup = original.with_name(original.name + ".bak")
+        old_backup = original.with_name(original.name + ".bak.old")
         if backup.exists():
-            backup.unlink()
+            old_backup.unlink(missing_ok=True)
+            backup.rename(old_backup)
         original.rename(backup)
         try:
             remuxed.rename(original)

@@ -107,7 +107,14 @@ class SubDlClient:
                 provider="subdl",
                 status_code=response.status_code,
             )
-        payload = response.json()
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            # Audit B6: proxies/CDNs sometimes answer 200 with an HTML error page.
+            raise ProviderError(
+                f"SubDL returned a 200 response that is not JSON: {response.text[:150]!r}",
+                provider="subdl",
+            ) from exc
         if payload.get("status") is False:
             error = str(payload.get("error") or "unknown SubDL error")
             raise ProviderError(f"SubDL error: {error}", provider="subdl")
@@ -210,13 +217,44 @@ class SubDlClient:
             return None
         logger.debug("SubDL search: %d entries for S%02dE%02d (%s)", len(results), season, episode, requested)
 
+        requested_languages = {part.strip().upper() for part in requested.split(",") if part.strip()}
+
+        def candidate_language(item: dict[str, Any]) -> str:
+            return str(item.get("lang") or item.get("language") or "").strip().upper()
+
+        def candidate_ok(item: dict[str, Any]) -> bool:
+            """Audit E1: SubDL's search filter is loose and may return releases
+            for other episodes/languages. Candidates that explicitly disagree
+            are rejected; missing fields are tolerated (they are optional)."""
+            candidate_episode = item.get("episode")
+            if candidate_episode is not None and str(candidate_episode) != str(episode):
+                return False
+            candidate_season = item.get("season")
+            if candidate_season is not None and str(candidate_season) != str(season):
+                return False
+            language = candidate_language(item)
+            if language and requested_languages and language not in requested_languages:
+                return False
+            return True
+
+        usable = [item for item in results if candidate_ok(item)]
+        if not usable:
+            logger.info(
+                "SubDL: all %d candidates rejected by episode/language validation (S%02dE%02d, %s)",
+                len(results),
+                season,
+                episode,
+                requested,
+            )
+            return None
+
         # Prefer results with an explicit episode match and the most releases.
         def rank(item: dict[str, Any]) -> tuple[int, int]:
             episode_match = 1 if str(item.get("episode") or "") == str(episode) else 0
             has_url = 1 if item.get("url") else 0
             return (has_url, episode_match)
 
-        for item in sorted(results, key=rank, reverse=True):
+        for item in sorted(usable, key=rank, reverse=True):
             texts = self._download_candidate(item)
             if not texts:
                 logger.debug("Skipping SubDL candidate %r (no content)", item.get("release_name"))
@@ -241,14 +279,20 @@ class SubDlClient:
                 episode,
                 item.get("release_name") or "?",
             )
+            # Audit E1: label the transcript with the language the candidate
+            # actually claims (fallback: the first requested language).
+            actual_language = (
+                str(item.get("lang") or item.get("language") or "").strip().lower()
+                or requested.split(",")[0]
+            )
             return Transcript(
                 source="subdl",
-                language=requested.split(",")[0],
+                language=actual_language,
                 lines=best,
             )
         logger.info(
             "No usable SubDL reference after %d candidates (S%02dE%02d, %s)",
-            len(results),
+            len(usable),
             season,
             episode,
             requested,

@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import json
 import logging
+
+from episodematch.core.exceptions import EpisodeMatchError
 import sqlite3
 import threading
 import time
@@ -73,6 +75,7 @@ class CacheDatabase:
     def __init__(self, db_path: Path | str, *, read_only: bool = False) -> None:
         self._path = Path(db_path)
         self._read_only = read_only
+        self._closed = False
         self._lock = threading.RLock()
         self._conn = self._open()
         self._migrate()
@@ -80,19 +83,34 @@ class CacheDatabase:
     # -- lifecycle -----------------------------------------------------------
 
     def _open(self) -> sqlite3.Connection:
-        if not self._read_only:
+        if self._read_only:
+            # Audit F6: open through a real read-only URI — the sqlite layer
+            # itself rejects writes instead of silently mutating.
+            conn = sqlite3.connect(
+                f"file:{self._path.as_posix()}?mode=ro",
+                check_same_thread=False,
+                timeout=15.0,
+                uri=True,
+            )
+        else:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(
-            str(self._path),
-            check_same_thread=False,
-            timeout=15.0,
-        )
+            conn = sqlite3.connect(
+                str(self._path),
+                check_same_thread=False,
+                timeout=15.0,
+            )
         conn.row_factory = sqlite3.Row
-        with self._lock:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA foreign_keys=ON")
+        if not self._read_only:
+            with self._lock:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.execute("PRAGMA foreign_keys=ON")
         return conn
+
+    def _require_writable(self) -> None:
+        """Audit F6: mutation methods fail fast in read-only mode."""
+        if self._read_only:
+            raise EpisodeMatchError(f"CacheDatabase is read-only ({self._path}) — mutation not allowed")
 
     def _migrate(self) -> None:
         with self._lock, self._conn:
@@ -110,6 +128,12 @@ class CacheDatabase:
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+            self._closed = True
+
+    @property
+    def is_closed(self) -> bool:
+        """Whether :meth:`close` has run (audit D2: shutdown handshake asserts)."""
+        return self._closed
 
     def __enter__(self) -> CacheDatabase:
         return self
@@ -132,6 +156,7 @@ class CacheDatabase:
         return json.loads(row["value"])
 
     def put_json(self, key: str, value: Any, *, ttl_seconds: float | None = None) -> None:
+        self._require_writable()
         """Store a JSON-serializable value, optionally expiring after ``ttl_seconds``."""
         expires_at = (time.time() + ttl_seconds) if ttl_seconds is not None else None
         payload = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
@@ -149,10 +174,12 @@ class CacheDatabase:
             )
 
     def delete(self, key: str) -> None:
+        self._require_writable()
         with self._lock, self._conn:
             self._conn.execute("DELETE FROM cache WHERE key = ?", (key,))
 
     def purge_expired(self) -> int:
+        self._require_writable()
         """Remove expired cache rows; returns the number of deleted rows."""
         now = time.time()
         with self._lock, self._conn:
@@ -181,6 +208,7 @@ class CacheDatabase:
         return json.loads(row["payload"]) if row else None
 
     def put_mkv_scan(self, path: Path, size_bytes: int, mtime: float, payload: dict[str, Any]) -> None:
+        self._require_writable()
         with self._lock, self._conn:
             self._conn.execute(
                 """
@@ -198,6 +226,7 @@ class CacheDatabase:
         return json.loads(row["payload"]) if row else None
 
     def put_disc(self, cache_key: str, series: str, payload: dict[str, Any]) -> None:
+        self._require_writable()
         with self._lock, self._conn:
             self._conn.execute(
                 """
@@ -229,6 +258,7 @@ class CacheDatabase:
         return meta
 
     def put_osdb_subtitle(self, subtitle_id: str, meta: dict[str, Any], srt_path: Path | None) -> None:
+        self._require_writable()
         with self._lock, self._conn:
             self._conn.execute(
                 """
@@ -241,6 +271,7 @@ class CacheDatabase:
     # -- maintenance ------------------------------------------------------------------
 
     def vacuum(self) -> None:
+        self._require_writable()
         with self._lock, self._conn:
             self._conn.execute("VACUUM")
 

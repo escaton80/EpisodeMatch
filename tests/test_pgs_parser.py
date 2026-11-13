@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import struct
+from typing import Sequence
 
 import pytest
 
@@ -392,6 +393,184 @@ class TestSupParsing:
         sup_path.write_bytes(make_sup_bytes([(2.0, 4.0, bitmap)], standard_palette))
         events = pgs.PgsSupParser().parse_file(sup_path)
         assert len(events) == 1 and events[0].start_seconds == pytest.approx(2.0)
+
+
+def _build_display_set(
+    *,
+    pts: float,
+    objects: Sequence[pgs.CompositionObject] = (),
+    palettes: Sequence[pgs.Palette] = (),
+    ods_objects: Sequence[pgs.ObjectDefinition] = (),
+    composition_state: pgs.CompositionState = pgs.CompositionState.NORMAL_CASE,
+    composition_number: int = 0,
+    palette_id: int = 0,
+    ) -> bytes:
+    """Hand-build one display set (PCS+WDS+PDS*+ODS*+END)."""
+    out = bytearray()
+    pcs = pgs.build_pcs_payload(
+        composition_number=composition_number,
+        composition_state=composition_state,
+        palette_id=palette_id,
+        objects=objects,
+    )
+    out += pgs.build_sup_segment(pgs.SegmentType.PCS, pcs, pts_seconds=pts)
+    windows = [
+        pgs.WindowDefinition(window_id=obj.window_id, x=obj.x, y=obj.y, width=4, height=4)
+        for obj in objects
+    ]
+    out += pgs.build_sup_segment(pgs.SegmentType.WDS, pgs.build_wds_payload(windows), pts_seconds=pts)
+    for palette in palettes:
+        out += pgs.build_sup_segment(pgs.SegmentType.PDS, pgs.build_pds_payload(palette), pts_seconds=pts)
+    for ods in ods_objects:
+        rle = pgs.encode_rle(bytes([1] * (ods.width * ods.height)), ods.width, ods.height)
+        for payload in pgs.build_ods_payloads(ods.object_id, ods.version, ods.width, ods.height, rle):
+            out += pgs.build_sup_segment(pgs.SegmentType.ODS, payload, pts_seconds=pts)
+    out += pgs.build_sup_segment(pgs.SegmentType.END, b"", pts_seconds=pts)
+    return bytes(out)
+
+
+class TestEpochPersistence:
+    """Audit C1/C2/C3: real-stream epoch semantics."""
+
+    def test_object_reuse_across_display_sets_yields_two_events(self, standard_palette: Palette) -> None:
+        """Audit C1: a normal-case PCS may reuse an object defined in an earlier
+        display set of the same epoch (objects persist until EPOCH_START)."""
+        ods_obj = pgs.ObjectDefinition(object_id=7, version=0, width=4, height=4)
+        placement = pgs.CompositionObject(object_id=7, window_id=0, forced=False, x=640, y=500)
+        set_a = _build_display_set(
+            pts=1.0,
+            objects=[placement],
+            palettes=[standard_palette],
+            ods_objects=[ods_obj],
+            composition_state=pgs.CompositionState.EPOCH_START,
+            composition_number=1,
+        )
+        # Same object again, NO ODS re-send (reuse), no palette.
+        set_b = _build_display_set(pts=3.0, objects=[placement], composition_number=2)
+        events = pgs.parse_sup_events(set_a + set_b)
+        assert len(events) == 2
+        assert events[1].start_seconds == pytest.approx(3.0)
+        assert bytes(events[1].bitmaps[0].indices) == bytes([1] * 16)
+
+    def test_partial_pds_update_merges_palette(self, standard_palette: Palette) -> None:
+        """Audit C2: a PDS that redefines only some color ids must not wipe the
+        other entries of the same palette id (decoders merge per color id)."""
+        base = pgs.Palette(
+            palette_id=0,
+            version=0,
+            entries={
+                1: pgs.PaletteEntry(color_id=1, y=200, cr=128, cb=128, alpha=255),
+                2: pgs.PaletteEntry(color_id=2, y=40, cr=128, cb=128, alpha=255),
+            },
+        )
+        partial_update = pgs.Palette(
+            palette_id=0,
+            version=1,
+            entries={2: pgs.PaletteEntry(color_id=2, y=40, cr=128, cb=128, alpha=64)},
+        )
+        ods_obj = pgs.ObjectDefinition(object_id=3, version=0, width=4, height=4)
+        placement = pgs.CompositionObject(object_id=3, window_id=0, forced=False, x=0, y=0)
+        set_a = _build_display_set(
+            pts=1.0,
+            objects=[placement],
+            palettes=[base],
+            ods_objects=[ods_obj],
+            composition_state=pgs.CompositionState.EPOCH_START,
+            composition_number=1,
+        )
+        set_b = _build_display_set(
+            pts=3.0,
+            objects=[placement],
+            palettes=[partial_update],
+            ods_objects=[ods_obj],  # re-sent so this test isolates the palette behavior
+            composition_number=2,
+        )
+        events = pgs.parse_sup_events(set_a + set_b)
+        assert len(events) == 2
+        lut = events[1].palette_lut
+        assert lut is not None
+        assert lut[1][3] == 255  # untouched entry survives the partial update
+        assert lut[2][3] == 64  # updated entry applied
+
+    def test_terminal_event_gets_default_duration(self, standard_palette: Palette) -> None:
+        """Audit C3: a stream ending with a visible display set and no clearing
+        PCS must not produce a zero-length event."""
+        ods_obj = pgs.ObjectDefinition(object_id=1, version=0, width=4, height=4)
+        placement = pgs.CompositionObject(object_id=1, window_id=0, forced=False, x=0, y=0)
+        sup = _build_display_set(
+            pts=10.0,
+            objects=[placement],
+            palettes=[standard_palette],
+            ods_objects=[ods_obj],
+            composition_state=pgs.CompositionState.EPOCH_START,
+        )
+        events = pgs.parse_sup_events(sup)
+        assert len(events) == 1
+        assert events[0].start_seconds == pytest.approx(10.0)
+        assert events[0].end_seconds == pytest.approx(12.0)  # default_event_duration
+
+    def test_terminal_event_custom_duration(self, standard_palette: Palette) -> None:
+        ods_obj = pgs.ObjectDefinition(object_id=1, version=0, width=4, height=4)
+        placement = pgs.CompositionObject(object_id=1, window_id=0, forced=False, x=0, y=0)
+        sup = _build_display_set(
+            pts=10.0,
+            objects=[placement],
+            palettes=[standard_palette],
+            ods_objects=[ods_obj],
+            composition_state=pgs.CompositionState.EPOCH_START,
+        )
+        events = pgs.parse_sup_events(sup, default_event_duration=5.0)
+        assert events[0].end_seconds == pytest.approx(15.0)
+
+
+class TestWindowedDecode:
+    """Audit C4: the event cap must bound the RLE *decoding*, not only OCR —
+    a full-film .sup must not decode every event bitmap when pillar 2 only
+    scans the first/last window."""
+
+    def _sup_with_events_at(self, palette: Palette, starts: Sequence[float]) -> bytes:
+        ods_obj = pgs.ObjectDefinition(object_id=1, version=0, width=4, height=4)
+        placement = pgs.CompositionObject(object_id=1, window_id=0, forced=False, x=0, y=0)
+        out = b""
+        for index, start in enumerate(starts):
+            out += _build_display_set(
+                pts=start,
+                objects=[placement],
+                palettes=[palette] if index == 0 else (),
+                ods_objects=[ods_obj] if index == 0 else (),  # later sets reuse the object
+                composition_state=pgs.CompositionState.EPOCH_START if index == 0 else pgs.CompositionState.NORMAL_CASE,
+                composition_number=index + 1,
+            )
+        return out
+
+    def test_without_window_every_event_is_decoded(self, standard_palette: Palette, monkeypatch: pytest.MonkeyPatch) -> None:
+        sup = self._sup_with_events_at(standard_palette, [float(i) for i in range(0, 100, 5)])
+        calls = {"n": 0}
+        real_decode = pgs.decode_rle
+
+        def counting_decode(data: bytes | bytearray, width: int, height: int) -> bytearray:
+            calls["n"] += 1
+            return real_decode(data, width, height)
+
+        monkeypatch.setattr(pgs, "decode_rle", counting_decode)
+        events = pgs.parse_sup_events(sup)
+        assert len(events) == 20
+        assert calls["n"] == 20
+
+    def test_pts_window_bounds_rle_decodes(self, standard_palette: Palette, monkeypatch: pytest.MonkeyPatch) -> None:
+        sup = self._sup_with_events_at(standard_palette, [float(i) for i in range(0, 100, 5)])
+        calls = {"n": 0}
+        real_decode = pgs.decode_rle
+
+        def counting_decode(data: bytes | bytearray, width: int, height: int) -> bytearray:
+            calls["n"] += 1
+            return real_decode(data, width, height)
+
+        monkeypatch.setattr(pgs, "decode_rle", counting_decode)
+        events = pgs.parse_sup_events(sup, pts_windows=[(0.0, 30.0)])
+        assert len(events) == 7  # starts 0..30 s only
+        assert calls["n"] == 7  # decoded ONLY the kept events (audit C4)
+        assert [e.start_seconds for e in events] == [0.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0]
 
 
 class TestWindowFilter:

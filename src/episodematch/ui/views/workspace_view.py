@@ -559,3 +559,8 @@ class WorkspaceView(QWidget):
             if worker is not None and worker.isRunning():
                 worker.cancel() if hasattr(worker, "cancel") else None
                 worker.wait(1500)
+
+    def is_busy(self) -> bool:
+        """True while any worker thread is still alive (audit D2 handshake)."""
+        workers = (self._scan_worker, self._search_worker, self._rename_worker, self._tag_worker)
+        return any(worker is not None and worker.isRunning() for worker in workers)

@@ -166,8 +166,10 @@ def parse_lavfi_scene_lines(output: str) -> list[float]:
             if part == "pts_time" or part.startswith("pts_time"):
                 continue
             try:
-                # Typical CSV row: "frame,0.000000" or with more columns.
-                if index > 0 and re.fullmatch(r"\d+(?:\.\d+)?", part):
+                # Typical CSV rows: "frame,0.000000" or with more columns.
+                # Audit C5: "-of csv=p=0" with one field prints bare pts_time
+                # rows (no leading "frame" column) — accept those too.
+                if (len(parts) == 1 or index > 0) and re.fullmatch(r"\d+(?:\.\d+)?", part):
                     times.append(float(part))
             except ValueError:
                 continue
@@ -235,6 +237,7 @@ class FrameScanner:
         max_frames_per_window: int = 12,
         frame_similarity_threshold: float = 12.0,
         keep_frames: bool = False,
+        title_card_minutes: float = 5.0,
     ) -> None:
         self._ffmpeg = Path(ffmpeg_path)
         self._ffprobe = Path(ffprobe_path)
@@ -244,7 +247,13 @@ class FrameScanner:
         self._max_frames = max_frames_per_window
         self._similarity_threshold = frame_similarity_threshold
         self._keep_frames = keep_frames
+        # Audit F4: the title-card window comes from ExtractionSettings.
+        self._title_card_minutes = title_card_minutes
         self._work_dir.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def title_card_minutes(self) -> float:
+        return self._title_card_minutes
 
     # -- public API ----------------------------------------------------------
 
@@ -256,7 +265,7 @@ class FrameScanner:
         max_frames: int | None = None,
     ) -> list[TitleCardHit]:
         """Scan both windows and return OCR-classified hits."""
-        windows = compute_scan_windows(duration_seconds)
+        windows = compute_scan_windows(duration_seconds, title_card_minutes=self._title_card_minutes)
         hits: list[TitleCardHit] = []
         cap = max_frames or self._max_frames
 

@@ -72,56 +72,90 @@ FORBIDDEN_TOOL_NAMES = frozenset({
 })
 
 
-def find_forbidden_tools(root: Path) -> list[Path]:
-    """Return GPL-licensed tool binaries accidentally placed inside a bundle."""
-    return sorted(
-        p for p in root.rglob("*")
-        if p.is_file() and p.suffix.lower() == ".exe" and p.name.lower() in FORBIDDEN_TOOL_NAMES
-    )
+def find_forbidden_tools(root: Path, *, allowed_top_level: set[str] | None = None) -> list[Path]:
+    """Return tool binaries that must not ship inside a bundle.
+
+    Two rules: the six known GPL tool names are forbidden *anywhere*; and
+    (audit F3) when ``allowed_top_level`` is given, any OTHER executable at the
+    bundle's top level is flagged too — a stray EXE in a PyInstaller onedir
+    bundle is almost certainly an accidentally copied third-party tool.
+    """
+    allowed = {name.lower() for name in allowed_top_level} if allowed_top_level is not None else None
+    found: list[Path] = []
+    for p in root.rglob("*"):
+        if not p.is_file() or p.suffix.lower() != ".exe":
+            continue
+        if p.name.lower() in FORBIDDEN_TOOL_NAMES:
+            found.append(p)
+        elif allowed is not None and len(p.relative_to(root).parts) == 1 and p.name.lower() not in allowed:
+            found.append(p)
+    return sorted(found)
 
 
-def build_release_zip() -> Path:
-    """Assemble the distributable release ZIP from the built bundles.
+def _app_version() -> str:
+    """The released version string (kept in sync with pyproject/__init__)."""
+    try:
+        from episodematch import __version__
+    except ImportError:
+        return "0.1.0"
+    return __version__
 
-    Contents: cli/ + gui/ onedir bundles, README-FIRST.txt (beta disclaimer +
-    setup steps), THIRD_PARTY_LICENSES.txt (LGPL/PSF/PyInstaller attributions),
-    LICENSES/LGPL-3.0-only.txt, and empty bin/ + data/ placeholders. Raises
-    SystemExit when GPL tool binaries are found inside the bundles.
+
+def build_release_zip() -> list[Path]:
+    """Assemble the TWO distributable release ZIPs (CLI + GUI) from the built
+    bundles — each archive ships its own bundle.
+
+    Per archive: README-FIRST.txt (beta disclaimer + setup steps),
+    THIRD_PARTY_LICENSES.txt (LGPL/PSF/PyInstaller attributions),
+    LICENSES/LGPL-3.0-only.txt, the project's own MIT LICENSE (audit F3), and
+    empty bin/ + data/ placeholders. Raises SystemExit when GPL tool binaries
+    (or any other unknown top-level executable) are found inside the bundles.
     """
     import zipfile
 
     cli_root = PROJECT_ROOT / "dist" / "cli" / "episodematch"
     gui_root = PROJECT_ROOT / "dist" / "gui" / "EpisodeMatch"
-    for root in (cli_root, gui_root):
+    bundle_rules = {
+        cli_root: {"episodematch.exe"},
+        gui_root: {"EpisodeMatch.exe"},
+    }
+    for root, allowed in bundle_rules.items():
         if not root.is_dir():
             raise SystemExit(f"Missing bundle: {root}")
-        forbidden = find_forbidden_tools(root)
+        forbidden = find_forbidden_tools(root, allowed_top_level=allowed)
         if forbidden:
             raise SystemExit(
-                "Licensing guard: GPL tool binaries found inside the bundle — "
-                "they must be fetched by the user via fetch-tools, not shipped: "
+                "Licensing guard: executables that must not ship were found inside the bundle — "
+                "GPL tools are fetched by the user via fetch-tools, not shipped: "
                 + ", ".join(str(p) for p in forbidden)
             )
 
-    zip_path = PROJECT_ROOT / "dist" / "EpisodeMatch-v0.1.0-win64.zip"
     readme_first = PROJECT_ROOT / "packaging" / "README-FIRST.txt"
     third_party = PROJECT_ROOT / "packaging" / "THIRD_PARTY_LICENSES.txt"
     lgpl_text = PROJECT_ROOT / "packaging" / "LICENSES" / "LGPL-3.0-only.txt"
+    license_file = PROJECT_ROOT / "LICENSE"
 
-    bundles = (("cli/episodematch", cli_root), ("gui/EpisodeMatch", gui_root))
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
-        zip_root = f"EpisodeMatch-v0.1.0-win64"
-        zf.writestr(f"{zip_root}/README-FIRST.txt", readme_first.read_text(encoding="utf-8"))
-        zf.writestr(f"{zip_root}/THIRD_PARTY_LICENSES.txt", third_party.read_text(encoding="utf-8"))
-        if lgpl_text.is_file():
-            zf.write(lgpl_text, f"{zip_root}/LICENSES/LGPL-3.0-only.txt")
-        zf.writestr(f"{zip_root}/bin/.gitkeep", "")
-        zf.writestr(f"{zip_root}/data/.gitkeep", "")
-        for arc_dir, bundle_root in bundles:
+    version = _app_version()
+    zips: list[Path] = []
+    for label, bundle_root in (("CLI", cli_root), ("GUI", gui_root)):
+        zip_path = PROJECT_ROOT / "dist" / f"EpisodeMatch-{label}-v{version}-win64.zip"
+        zip_root = f"EpisodeMatch-{label}-v{version}-win64"
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+            zf.writestr(f"{zip_root}/README-FIRST.txt", readme_first.read_text(encoding="utf-8"))
+            zf.writestr(f"{zip_root}/THIRD_PARTY_LICENSES.txt", third_party.read_text(encoding="utf-8"))
+            # Audit F3: the archive must carry the project's own MIT license text.
+            if license_file.is_file():
+                zf.writestr(f"{zip_root}/LICENSE", license_file.read_text(encoding="utf-8"))
+            if lgpl_text.is_file():
+                zf.write(lgpl_text, f"{zip_root}/LICENSES/LGPL-3.0-only.txt")
+            zf.writestr(f"{zip_root}/bin/.gitkeep", "")
+            zf.writestr(f"{zip_root}/data/.gitkeep", "")
+            arc_dir = "cli/episodematch" if label == "CLI" else "gui/EpisodeMatch"
             for p in bundle_root.rglob("*"):
                 if p.is_file():
                     zf.write(p, f"{zip_root}/{arc_dir}/" + p.relative_to(bundle_root).as_posix())
-    return zip_path
+        zips.append(zip_path)
+    return zips
 
 
 def main() -> int:
@@ -135,7 +169,7 @@ def main() -> int:
     run_pyinstaller("EpisodeMatch", console=False, entry="packaging/gui_entry.py", distpath="dist/gui", workpath="build/gui")
 
     cli_exe = PROJECT_ROOT / "dist" / "cli" / "episodematch" / "episodematch.exe"
-    gui_exe = PROJECT_ROOT / "dist" / "gui" / "EpisodeMatch.exe"
+    gui_exe = PROJECT_ROOT / "dist" / "gui" / "EpisodeMatch" / "EpisodeMatch.exe"
     if not cli_exe.is_file() or not gui_exe.is_file():
         raise SystemExit("Expected executables were not produced")
 
@@ -143,8 +177,8 @@ def main() -> int:
         smoke_test(gui_exe, cli_exe)
 
     if not args.no_zip:
-        zip_path = build_release_zip()
-        print(f"  ZIP: {zip_path}")
+        for zip_path in build_release_zip():
+            print(f"  ZIP: {zip_path}")
 
     print("\nBuild complete:")
     print(f"  CLI: {cli_exe}")

@@ -287,7 +287,14 @@ class LlmArbiter:
                 f"LLM endpoint returned HTTP {response.status_code}: {response.text[:300]}",
                 status_code=response.status_code,
             )
-        payload = response.json()
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            # Audit B6: a 200 with a non-JSON body must become LlmError so the
+            # arbiter's retry loop handles it (raw JSONDecodeError would escape).
+            raise LlmError(
+                f"LLM endpoint returned a 200 response that is not JSON: {response.text[:300]!r}"
+            ) from exc
         try:
             choices = payload["choices"]
             content = choices[0]["message"]["content"]
@@ -355,15 +362,14 @@ def merge_verdict_into_candidates(
         candidate = by_name.get(assignment.file) or lowered.get(assignment.file.lower())
         if candidate is None or assignment.episode is None:
             continue
-        contribution = assignment.confidence + boost
-        candidate.episode_scores[assignment.episode] = (
-            candidate.episode_scores.get(assignment.episode, 0.0) + contribution
-        )
-        candidate.evidence.append(
+        # Audit A4: route through add_evidence so the calibrated per-pillar
+        # aggregation applies (direct episode_scores mutation would bypass it).
+        contribution = min(1.0, assignment.confidence + boost)
+        candidate.add_evidence(
             Evidence(
                 pillar=Pillar.LLM,
                 kind="arbiter_assignment",
-                score=assignment.confidence,
+                score=contribution,
                 summary=(
                     f"LLM arbiter ({verdict.model or 'model'}) assigns {assignment.file} to "
                     f"E{assignment.episode:02d} at {assignment.confidence:.0%}: {assignment.reason}"

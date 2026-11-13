@@ -245,10 +245,15 @@ def match_fingerprint(
         if mpls and entry.mpls_name and mpls == entry.mpls_name:
             score += 0.60
             reasons.append(f"MPLS {entry.mpls_name} matches disc entry")
+        # Audit A2: a title-index match against an entry whose MPLS *contradicts*
+        # the rip's known MPLS is a numbering coincidence — it must never add to
+        # the score, otherwise it outranks the exact MPLS identity match.
+        mpls_conflict = bool(mpls and entry.mpls_name and mpls != entry.mpls_name)
         if (
             fingerprint.make_mkv_index is not None
             and entry.make_mkv_index is not None
             and fingerprint.make_mkv_index == entry.make_mkv_index
+            and not mpls_conflict
         ):
             if duration_close:
                 score += index_weight
