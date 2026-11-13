@@ -9,5 +9,5 @@ from __future__ import annotations
 
 __all__ = ["__version__", "__app_name__"]
 
-__version__ = "0.1.0"
+__version__ = "0.11.0"
 __app_name__ = "EpisodeMatch"
