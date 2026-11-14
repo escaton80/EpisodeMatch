@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import io
 import logging
+import time
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,25 @@ logger = logging.getLogger(__name__)
 
 SUBDL_API_BASE = "https://api3.subdl.com/api/v1"  # api.subdl.com does not resolve (stale docs)
 SUBDL_DOWNLOAD_HOST = "https://dl.subdl.com"
+
+#: Transient 429 "service_busy" responses are retried only when the hint is short.
+_MAX_THROTTLE_WAIT = 15.0
+
+
+def _parse_retry_after(response: httpx.Response) -> float:
+    """Seconds to wait for a 429; prefers the JSON body's retryAfterSeconds."""
+    try:
+        payload = response.json()
+        seconds = float(payload.get("retryAfterSeconds") or 0)
+        if seconds > 0:
+            return min(seconds, _MAX_THROTTLE_WAIT)
+    except (ValueError, AttributeError):
+        pass
+    header = response.headers.get("retry-after") or response.headers.get("x-ratelimit-reset") or "0"
+    try:
+        return min(max(0.0, float(header)), _MAX_THROTTLE_WAIT)
+    except ValueError:
+        return 1.0
 
 
 def to_subdl_languages(languages: str | None) -> str:
@@ -91,16 +111,34 @@ class SubDlClient:
     # -- low level ------------------------------------------------------------------
 
     def _get(self, url: str, params: dict[str, Any]) -> dict:
-        try:
-            response = self.client.get(url, params=params)
-        except httpx.HTTPError as exc:
-            raise ProviderError(f"SubDL request failed: {exc}", provider="subdl") from exc
-        if response.status_code in (402, 429):
-            raise RateLimitError(
-                f"SubDL limit hit (HTTP {response.status_code}): {response.text[:150]}",
-                provider="subdl",
-                status_code=response.status_code,
-            )
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                response = self.client.get(url, params=params)
+            except httpx.HTTPError as exc:
+                raise ProviderError(f"SubDL request failed: {exc}", provider="subdl") from exc
+            if response.status_code == 402:
+                raise RateLimitError(
+                    f"SubDL limit hit (HTTP 402): {response.text[:150]}",
+                    provider="subdl",
+                    status_code=402,
+                )
+            if response.status_code == 429:
+                # SubDL returns transient "service_busy" 429s (often with a
+                # retryAfterSeconds hint) when a scan searches many episodes
+                # back to back. Retry briefly instead of losing the episode's
+                # reference; give up once the throttle looks persistent.
+                retry_after = _parse_retry_after(response)
+                if retry_after <= _MAX_THROTTLE_WAIT and attempts <= 2:
+                    time.sleep(retry_after)
+                    continue
+                raise RateLimitError(
+                    f"SubDL limit hit (HTTP 429): {response.text[:150]}",
+                    provider="subdl",
+                    status_code=429,
+                )
+            break
         if response.status_code != 200:
             raise ProviderError(
                 f"SubDL returned HTTP {response.status_code}: {response.text[:150]}",
@@ -220,22 +258,57 @@ class SubDlClient:
         requested_languages = {part.strip().upper() for part in requested.split(",") if part.strip()}
 
         def candidate_language(item: dict[str, Any]) -> str:
-            return str(item.get("lang") or item.get("language") or "").strip().upper()
+            """The ISO code of a candidate, or "" when unknown.
+
+            SubDL sends TWO language fields: ``lang`` is the full display name
+            ("English") and ``language`` is the ISO 639-1 code ("EN"). Only a
+            short ISO-shaped code is comparable against a requested language —
+            comparing the full name against "EN" rejected 10/10 real candidates
+            for The Americans S01 (v0.11.0 regression).
+            """
+            iso = str(item.get("language") or "").strip().upper()
+            if iso and len(iso) <= 3:
+                return iso
+            code = str(item.get("lang") or "").strip().upper()
+            return code if code and len(code) <= 3 else ""
+
+        def _as_int(value: Any) -> int | None:
+            try:
+                return int(str(value).strip())
+            except (TypeError, ValueError):
+                return None
+
+        def episode_covered(item: dict[str, Any], episode_number: int) -> bool:
+            """Whether this package plausibly contains the wanted episode.
+
+            full-season packs cover every episode; range packs match by
+            containment (``episode_from``/``episode_end``); an unknown episode
+            value (None/0/non-numeric — typical for season packs) is tolerated;
+            only an explicit positive mismatch is rejected.
+            """
+            if bool(item.get("full_season")):
+                return True
+            from_value = _as_int(item.get("episode_from"))
+            end_value = _as_int(item.get("episode_end"))
+            if from_value is not None and end_value and from_value <= episode_number <= end_value:
+                return True
+            episode_value = _as_int(item.get("episode"))
+            if episode_value is None or episode_value <= 0:
+                return True
+            return episode_value == episode_number
 
         def candidate_ok(item: dict[str, Any]) -> bool:
             """Audit E1: SubDL's search filter is loose and may return releases
             for other episodes/languages. Candidates that explicitly disagree
-            are rejected; missing fields are tolerated (they are optional)."""
-            candidate_episode = item.get("episode")
-            if candidate_episode is not None and str(candidate_episode) != str(episode):
-                return False
+            are rejected; missing/unknown fields are tolerated (they are
+            optional and season/range packs carry no episode at all)."""
             candidate_season = item.get("season")
             if candidate_season is not None and str(candidate_season) != str(season):
                 return False
             language = candidate_language(item)
             if language and requested_languages and language not in requested_languages:
                 return False
-            return True
+            return episode_covered(item, episode)
 
         usable = [item for item in results if candidate_ok(item)]
         if not usable:
@@ -248,9 +321,18 @@ class SubDlClient:
             )
             return None
 
-        # Prefer results with an explicit episode match and the most releases.
+        # Prefer results whose episode is explicitly the requested one (exact
+        # episode field or range containment) and the most releases.
         def rank(item: dict[str, Any]) -> tuple[int, int]:
-            episode_match = 1 if str(item.get("episode") or "") == str(episode) else 0
+            episode_match = 0
+            episode_value = _as_int(item.get("episode"))
+            if episode_value is not None and episode_value == episode:
+                episode_match = 1
+            else:
+                from_value = _as_int(item.get("episode_from"))
+                end_value = _as_int(item.get("episode_end"))
+                if from_value is not None and end_value and from_value <= episode <= end_value:
+                    episode_match = 1
             has_url = 1 if item.get("url") else 0
             return (has_url, episode_match)
 
@@ -280,11 +362,14 @@ class SubDlClient:
                 item.get("release_name") or "?",
             )
             # Audit E1: label the transcript with the language the candidate
-            # actually claims (fallback: the first requested language).
-            actual_language = (
-                str(item.get("lang") or item.get("language") or "").strip().lower()
-                or requested.split(",")[0]
-            )
+            # actually claims — the ISO "language" field ("EN"), not the full
+            # display name (fallback: the first requested language).
+            actual_language = str(item.get("language") or "").strip().lower()
+            if not actual_language:
+                display = str(item.get("lang") or "").strip().lower()
+                if display and len(display) <= 3:
+                    actual_language = display
+            actual_language = actual_language or requested.split(",")[0]
             return Transcript(
                 source="subdl",
                 language=actual_language,

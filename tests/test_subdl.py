@@ -12,7 +12,7 @@ import httpx
 import pytest
 
 from episodematch.core.config import AppConfig, apply_env_overrides
-from episodematch.core.exceptions import ProviderError
+from episodematch.core.exceptions import ProviderError, RateLimitError
 from episodematch.providers.subdl import SubDlClient, to_subdl_languages
 from tests.test_pipeline import FakeFfprobe, FakeTmdb, make_guide
 
@@ -372,3 +372,160 @@ class TestSubdlCandidateValidation:
         transcript = client.reference_transcript(tmdb_id=1, season=1, episode=1, languages="de")
         assert transcript is not None
         assert transcript.language == "de"  # fallback: requested language
+
+class TestSubdlRealResponseShapes:
+    """Regression for the v0.11.0 subtitle regression: real SubDL responses
+    carry lang="English" (full name, NOT an ISO code), language="EN" (ISO) and
+    full-season packages with episode=None / episode_end=0. The v0.11.0
+    candidate_ok filter rejected 10/10 real candidates for S01E01 of
+    "The Americans" (all because of the lang full-name comparison) and killed
+    pillar 2 entirely."""
+
+    def _real_shape_entry(self, **overrides: Any) -> dict[str, Any]:
+        entry = {
+            "release_name": "The Americans (2013), SEASON 1, 1080p x265 [23.976 FPS]",
+            "name": "The Americans (2013), SEASON 1, 1080p x265 [23.976 FPS].zip",
+            "lang": "English",
+            "author": "uploader",
+            "url": "/subtitle/3658757-8575372.zip",
+            "season": 1,
+            "episode": None,
+            "language": "EN",
+            "framerate": 2,
+            "fps": "23.976",
+            "hi": False,
+            "episode_from": None,
+            "episode_end": 0,
+            "full_season": True,
+        }
+        entry.update(overrides)
+        return entry
+
+    def _handler(self, candidates: list[dict[str, Any]], downloaded: list[str]) -> Any:
+        def handler(request: httpx.Request) -> httpx.Response:
+            url = str(request.url)
+            if url.startswith("https://api3.subdl.com/api/v1/subtitles"):
+                return httpx.Response(200, json={"status": True, "subtitles": candidates})
+            for candidate in candidates:
+                if candidate.get("url") and url == f"https://dl.subdl.com{candidate['url']}":
+                    downloaded.append(url)
+                    return httpx.Response(200, content=_zip_bytes(("sub.srt", _SRT_BYTES)))
+            return httpx.Response(404)
+
+        return handler
+
+    def test_full_language_name_is_accepted(self) -> None:
+        """lang='English' (full name) must NOT be rejected against a 'en'
+        request — validation uses the ISO 'language' field instead."""
+        downloaded: list[str] = []
+        client = _make_client(self._handler([self._real_shape_entry()], downloaded))
+        transcript = client.reference_transcript(tmdb_id=1, season=1, episode=1, languages="en")
+        assert transcript is not None and transcript.lines
+
+    def test_full_season_package_with_episode_none_is_accepted(self) -> None:
+        downloaded: list[str] = []
+        entry = self._real_shape_entry(episode=None, full_season=True, episode_end=0)
+        client = _make_client(self._handler([entry], downloaded))
+        transcript = client.reference_transcript(tmdb_id=1, season=1, episode=1, languages="en")
+        assert transcript is not None
+
+    def test_episode_string_with_leading_zero_is_accepted(self) -> None:
+        downloaded: list[str] = []
+        entry = self._real_shape_entry(episode="01", full_season=False, episode_from="01", episode_end="01")
+        client = _make_client(self._handler([entry], downloaded))
+        transcript = client.reference_transcript(tmdb_id=1, season=1, episode=1, languages="en")
+        assert transcript is not None
+
+    def test_episode_range_containment_is_accepted_and_ranked_first(self) -> None:
+        """A pack covering episodes 4-6 matches a request for episode 5 and
+        outranks a full-season pack."""
+        downloaded: list[str] = []
+        candidates = [
+            self._real_shape_entry(release_name="season-pack", full_season=True),
+            self._real_shape_entry(
+                release_name="episodes-4-6-pack",
+                episode=None,
+                full_season=False,
+                episode_from=4,
+                episode_end=6,
+                url="/subtitle/range.zip",
+            ),
+        ]
+        client = _make_client(self._handler(candidates, downloaded))
+        transcript = client.reference_transcript(tmdb_id=1, season=1, episode=5, languages="en")
+        assert transcript is not None
+        assert downloaded == ["https://dl.subdl.com/subtitle/range.zip"]  # range pack wins
+
+    def test_zero_episode_counts_as_unknown_not_wrong(self) -> None:
+        downloaded: list[str] = []
+        entry = self._real_shape_entry(episode=0, full_season=False, episode_from=None, episode_end=0)
+        client = _make_client(self._handler([entry], downloaded))
+        transcript = client.reference_transcript(tmdb_id=1, season=1, episode=1, languages="en")
+        assert transcript is not None
+
+    def test_explicit_wrong_single_episode_still_rejected(self) -> None:
+        """E1's original intent survives: a package for exactly episode 2 must
+        not be served for a request for episode 1."""
+        downloaded: list[str] = []
+        entry = self._real_shape_entry(episode=2, full_season=False, episode_from=2, episode_end=2)
+        client = _make_client(self._handler([entry], downloaded))
+        transcript = client.reference_transcript(tmdb_id=1, season=1, episode=1, languages="en")
+        assert transcript is None
+
+    def test_wrong_iso_language_field_still_rejected(self) -> None:
+        downloaded: list[str] = []
+        entry = self._real_shape_entry(language="FR")
+        client = _make_client(self._handler([entry], downloaded))
+        transcript = client.reference_transcript(tmdb_id=1, season=1, episode=1, languages="en")
+        assert transcript is None
+
+    def test_transcript_language_labeled_from_iso_language_field(self) -> None:
+        """The label must be the ISO code ('en'), not the full name
+        ('english') and not silently the requested language."""
+        downloaded: list[str] = []
+        client = _make_client(self._handler([self._real_shape_entry()], downloaded))
+        transcript = client.reference_transcript(tmdb_id=1, season=1, episode=1, languages="en")
+        assert transcript is not None
+        assert transcript.language == "en"
+
+class TestSubdlThrottleRetry:
+    """SubDL answers transient 429 "service_busy" with retryAfterSeconds while
+    a scan hammers the search endpoint for 13 episodes back to back. The client
+    must retry briefly instead of failing the episode's reference entirely
+    (observed live: E03/E04 of The Americans disc 1 lost their references)."""
+
+    def test_429_with_retry_after_is_retried(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        sleeps: list[float] = []
+        monkeypatch.setattr(
+            "episodematch.providers.subdl.time.sleep",
+            lambda seconds: sleeps.append(seconds),
+        )
+        calls = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return httpx.Response(
+                    429,
+                    json={"status": False, "statusCode": 429, "error": "service_busy", "retryAfterSeconds": 5},
+                )
+            return httpx.Response(200, json={"status": True, "subtitles": []})
+
+        client = _make_client(handler)
+        payload = client._get("https://api3.subdl.com/api/v1/subtitles", {"film_name": "x"})
+        assert payload.get("status") is True
+        assert calls["n"] == 2
+        assert sleeps == [5.0]  # retryAfterSeconds honored
+
+    def test_429_persists_raises_ratelimit_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("episodematch.providers.subdl.time.sleep", lambda seconds: None)
+        calls = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            return httpx.Response(429, json={"error": "service_busy", "retryAfterSeconds": 5})
+
+        client = _make_client(handler)
+        with pytest.raises(RateLimitError):
+            client._get("https://api3.subdl.com/api/v1/subtitles", {"film_name": "x"})
+        assert calls["n"] == 3  # initial + 2 retries
