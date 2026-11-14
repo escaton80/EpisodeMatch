@@ -1,5 +1,5 @@
 🚨 **PLEASE READ BEFORE DOWNLOADING (Early Beta & Manage Your Expectations):**
-This is **v0.1.0 — an early, experimental beta**, and **I really don't want to overpromise here!** Please **only download this if you enjoy testing raw, early software and fully expect that things might fail or not work on your setup.**
+This is **v0.11.1 — an early, experimental beta**, and **I really don't want to overpromise here!** Please **only download this if you enjoy testing raw, early software and fully expect that things might fail or not work on your setup.**
 * **Your mileage WILL vary:** While I had a few successful test runs on my own discs (tested South Park Season 6 (USA Blu-ray), Walking Dead Season 1 (German Blu-ray), The Americans Season 1 (UK Blu-ray) and Castle Rock Season 1 (German Blu-Ray)), a lot of the matching logic (especially the subtitle comparison) is still heavily based on theory. Just because it worked on my test rips does **not** mean you will automatically get the same results on yours!
 * **USE AT YOUR OWN RISK — NO GUARANTEES:** Even though the renamer has an undo journal, **DO NOT run this on video files you don't have a backup of** (or can't easily re-rip). Always test on a backup copy first! I take zero responsibility for mangled filenames or broken MKV headers.
 
@@ -21,7 +21,7 @@ then renames the files into Plex/Jellyfin/Emby layout (with an undo journal), wr
 episode titles into the MKV header, and optionally cleans tracks or queues the results
 for AV1 encoding.
 
-> **Status: first public beta (v0.1.0).** The **Disc DB** and **Subtitles** pillars are
+> **Status: early public beta (v0.11.1).** The **Disc DB** and **Subtitles** pillars are
 > production-ready and are what the tool is built around. Everything else (Audio/Whisper,
 > Title-card OCR, LLM arbiter, the Visual Verify and Post-Processing pages) is
 > **explicitly not ready** and marked as such inside the app. See
@@ -164,6 +164,12 @@ Two sources are built in and selectable in **Settings → Subtitle source**:
 | [OpenSubtitles](https://opensubtitles.com) | **5 downloads / 24 h** | Precise API — but the download cap makes it impractical for whole seasons |
 | [SubDL](https://subdl.com) | **2,000 requests + 300 downloads / day** | **Recommended** — serves ZIP archives with SRTs, extracted automatically; cached locally for 14 days |
 
+SubDL candidates are validated against the request (ISO language code, season, and the
+episode field or `episode_from`/`episode_end` range) — whole-season subtitle packs are
+used automatically when no per-episode SRT exists, so US/international shows work even
+when only season packs are indexed. Transient SubDL rate-limit responses (429
+"service_busy") are retried automatically.
+
 ### Step 3 — coverage-based dialog scoring
 
 For each candidate episode, EpisodeMatch counts how many **distinct reference lines** of
@@ -246,13 +252,17 @@ from mkvtoolnix.download, SeConv from the SubtitleEdit GitHub releases).
 * `dist\gui\EpisodeMatch\EpisodeMatch.exe` — the windowed Windows-11 GUI
 
 Run them from a directory that contains `./bin/` and `./data/` (typically the project
-root). Each bundle is ~255 MB.
+root). Each bundle is ~255 MB. Prebuilt archives ship on the GitHub Releases page as
+**two separate ZIPs** — one for the CLI, one for the GUI — each with the license texts
+included (the GPL tools themselves are fetched by `episodematch fetch-tools` on your
+machine, keeping the archives GPL-clean).
 
 ## Status: what's ready and what's not
 
-This is the **first public beta (v0.1.0)**. Pillar 1 and 2 are production-ready and were
+This is the **early public beta (v0.11.1)**. Pillar 1 and 2 are production-ready and were
 validated against real rips (South Park S6D1: 9/9 at 100 %; Castle Rock S1D2: 5/5 at
-80 %; The Walking Dead S1D1 with live SubDL references). Everything else is present but
+80 %; The Walking Dead S1D1 and The Americans S1D1 — 4/4 at 93 % — with live SubDL
+references). Everything else is present but
 **not ready**: Audio/Whisper, Title-card OCR and the LLM arbiter are marked *not ready*
 in the pillar checkboxes; the Visual Verify and Post-Processing pages are marked *beta*
 and show an in-page warning banner. Treat them as previews — do not rely on their
@@ -287,7 +297,7 @@ Begründung — und benennt sie anschließend Plex/Jellyfin/Emby-gerecht um (mit
 Undo-Journal), schreibt den Episodentitel per `mkvpropedit` in den MKV-Header und kann
 optional Spuren bereinigen oder für AV1-Encoding in eine Warteschlange stellen.
 
-> **Status: erste öffentliche Beta (v0.1.0).** Die Säulen **Disc DB** und **Subtitles**
+> **Status: frühe öffentliche Beta (v0.11.1).** Die Säulen **Disc DB** und **Subtitles**
 > sind produktionsreif. Alles andere (Audio/Whisper, Title-card OCR, LLM arbiter, die
 > Seiten Visual Verify und Post-Processing) ist **bewusst noch nicht fertig** und ist im
 > Programm entsprechend markiert.
@@ -340,7 +350,11 @@ nummerierte die Playlists anders → **5/5 korrekt @ 80 %** über die eindeutige
 2. **Referenz in der richtigen Sprache:** Die Referenz wird **in der Sprache der
    extrahierten Spur** angefragt (`ger` → deutsche Referenz) — bei OpenSubtitles oder
    **SubDL (empfohlen: 2.000 Requests + 300 Downloads/Tag statt 5/24h)**. Referenzen
-   werden lokal gecacht (Rescans verbrauchen kein Kontingent).
+   werden lokal gecacht (Rescans verbrauchen kein Kontingent). SubDL-Kandidaten werden
+   gegen die Anfrage validiert (ISO-Sprachcode, Staffel, Episoden-Feld bzw.
+   `episode_from`/`episode_end`-Bereich) — wenn keine Einzel-Episoden-SRT verfügbar
+   ist, werden automatisch Staffel-Pakete genutzt; flüchtige 429-Antworten
+   („service_busy") werden automatisch wiederholt.
 3. **Coverage-Scoring:** Es wird gezählt, wie viele **eindeutige Referenzzeilen** der
    Kandidaten-Episode durch die Extraktion bestätigt werden (Fuzzy ≥ 80). Die richtige
    Episode deckt ~100 % ihrer eigenen Referenz ab; falsche nur ~9–20 % (Generika +
@@ -390,6 +404,10 @@ Fertige EXEs (ohne Python-Installation lauffähig):
 
 * `dist\cli\episodematch\episodematch.exe` — Konsole-CLI
 * `dist\gui\EpisodeMatch\EpisodeMatch.exe` — Windows-11-GUI
+
+Fertige Archive gibt es auf der GitHub-Releases-Seite als **zwei separate ZIPs** (CLI und
+GUI), jeweils mit Lizenztexten — die GPL-Tools lädt `episodematch fetch-tools` selbst
+nach, damit die Archive GPL-frei bleiben.
 
 ## Lizenz
 
