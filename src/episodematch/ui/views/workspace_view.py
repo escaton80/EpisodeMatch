@@ -53,6 +53,32 @@ _COL_CONF = 3
 _COL_METHODS = 4
 
 
+# Stage weights for the whole-scan progress bar (sum = 1.0). The pipeline
+# reports stage-local percentages; the view combines them so the bar reflects
+# ALL stages instead of hitting 100 % after the initial probe.
+_STAGE_WEIGHTS: dict[str, float] = {
+    "probe": 0.10,
+    "fast": 0.15,
+    "subtitles": 0.30,
+    "audio": 0.15,
+    "visual": 0.15,
+    "llm": 0.10,
+    "solve": 0.05,
+}
+
+
+def _combined_percent(stage_value: str, local_percent: float | None) -> int | None:
+    """Map a stage-local percent onto the whole-scan scale (0..100)."""
+    if local_percent is None:
+        return None
+    offset = 0.0
+    for stage, weight in _STAGE_WEIGHTS.items():
+        if stage == stage_value:
+            return int(round((offset + weight * local_percent / 100.0) * 100))
+        offset += weight
+    return None
+
+
 class WorkspaceView(QWidget):
     """Main view: everything needed to identify and rename one disc folder."""
 
@@ -92,6 +118,9 @@ class WorkspaceView(QWidget):
         self._progress_caption = CaptionLabel("")
         self._progress_caption.setVisible(False)
         root.addWidget(self._progress_caption)
+        self._activity_caption = CaptionLabel("")
+        self._activity_caption.setVisible(False)
+        root.addWidget(self._activity_caption)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self._build_results_card())
@@ -341,6 +370,8 @@ class WorkspaceView(QWidget):
         self._set_scan_running(True)
         self._progress.setVisible(True)
         self._progress_caption.setVisible(True)
+        self._activity_caption.setVisible(True)
+        self._activity_caption.setText("")
         self._progress.setValue(0)
         self._show_banner("info", f"Scanning {folder.name} for {self._selected_series} S{self._season_spin.value():02d}…")
         self._scan_worker = ScanWorker(
@@ -380,17 +411,27 @@ class WorkspaceView(QWidget):
         self._search_button.setEnabled(not running)
 
     def _on_scan_progress(self, event) -> None:  # noqa: ANN001 - ProgressEvent
-        if event.percent is not None:
-            self._progress.setValue(int(event.percent))
+        combined = _combined_percent(event.stage.value, event.percent)
+        if combined is not None and combined > self._progress.value():
+            self._progress.setValue(combined)
         self._progress_caption.setText(f"{event.stage.value}: {event.message}")
 
     def _on_pillar_report(self, file_name: str, pillar: str, status: str, detail: str) -> None:
         logger.debug("pillar %s/%s: %s (%s)", file_name, pillar, status, detail)
+        # Clearly visible working indicator: which file is being processed
+        # right now and what the pillar just did with it (tooltip = detail).
+        self._activity_caption.setVisible(True)
+        self._activity_caption.setText(f"{file_name}  ·  {pillar}  ·  {status}")
+        self._activity_caption.setToolTip(detail)
 
     def _on_scan_finished(self, report: object) -> None:
         scan_report: ScanReport = report  # type: ignore[assignment]
         self._set_scan_running(False)
         self._progress.setValue(100)
+        self._progress_caption.setText(
+            f"Done — {len(scan_report.assignment.entries)}/{len(scan_report.candidates or [])} "
+            f"assigned, avg confidence {scan_report.assignment.average_confidence:.0%}"
+        )
         assignment = scan_report.assignment
         self._context.last_report = scan_report
         self._context.last_folder = Path(self._folder_edit.text().strip())

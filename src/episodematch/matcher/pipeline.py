@@ -740,9 +740,16 @@ class Pipeline:
                 )
             return None
 
-        for mkv, candidate in probed:
+        total_files = len(probed)
+        for index, (mkv, candidate) in enumerate(probed):
             if self._cancelled():
                 raise EpisodeMatchError("Scan cancelled by user")
+            self._progress(
+                PipelineStage.SUBTITLES,
+                f"Extracting dialog from {mkv.file_name} ({index + 1}/{total_files})",
+                file_name=mkv.file_name,
+                percent=(index + 1) / total_files * 100.0,
+            )
             try:
                 transcripts = extractor.extract_all(
                     mkv,
@@ -855,9 +862,16 @@ class Pipeline:
             for mkv, _candidate in probed:
                 self._report(report, mkv.file_name, "audio", "skipped", str(exc))
             return
-        for mkv, candidate in probed:
+        total_files = len(probed)
+        for index, (mkv, candidate) in enumerate(probed):
             if self._cancelled():
                 raise EpisodeMatchError("Scan cancelled by user")
+            self._progress(
+                PipelineStage.AUDIO,
+                f"Transcribing audio of {mkv.file_name} ({index + 1}/{total_files})",
+                file_name=mkv.file_name,
+                percent=(index + 1) / total_files * 100.0,
+            )
             try:
                 transcript = snipper.transcribe_file(mkv.path, mkv.duration_seconds)
             except EpisodeMatchError as exc:
@@ -914,9 +928,16 @@ class Pipeline:
             "guest": self._config.matching.credit_weight_guest,
             "title": self._config.matching.credit_weight_title,
         }
-        for mkv, candidate in probed:
+        total_files = len(probed)
+        for index, (mkv, candidate) in enumerate(probed):
             if self._cancelled():
                 raise EpisodeMatchError("Scan cancelled by user")
+            self._progress(
+                PipelineStage.VISUAL,
+                f"Scanning title cards of {mkv.file_name} ({index + 1}/{total_files})",
+                file_name=mkv.file_name,
+                percent=(index + 1) / total_files * 100.0,
+            )
             try:
                 hits = scanner.scan(mkv.path, duration_seconds=mkv.duration_seconds)
             except EpisodeMatchError as exc:

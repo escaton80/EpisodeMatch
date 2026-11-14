@@ -610,3 +610,59 @@ class TestAppIcon:
         monkeypatch.setattr(_sys, "_MEIPASS", str(tmp_path), raising=False)
         icon = app_icon_path()
         assert icon == assets / "episode_match.jpg"
+
+class TestScanProgressDisplay:
+    """The center progress bar must reflect ALL scan stages (not jump to 100 %
+    after the probe) and the current activity must be clearly visible."""
+
+    def _emit(self, view: WorkspaceView, events: list) -> list[int]:
+        values = []
+        for event in events:
+            view._on_scan_progress(event)
+            values.append(view._progress.value())
+        return values
+
+    def test_combined_percent_is_monotonic_and_stage_weighted(self, qapp: QApplication, ui_context: AppContext) -> None:
+        from episodematch.core.models import PipelineStage, ProgressEvent
+
+        view = WorkspaceView(ui_context)
+        values = self._emit(
+            view,
+            [
+                ProgressEvent(stage=PipelineStage.PROBE, message="Probed a.mkv", percent=100.0),
+                ProgressEvent(stage=PipelineStage.SUBTITLES, message="Extracting dialog from b.mkv", percent=0.0),
+                ProgressEvent(stage=PipelineStage.SUBTITLES, message="b.mkv: best match E01 (90%)", percent=50.0),
+                ProgressEvent(stage=PipelineStage.SOLVE, message="Solving global assignment…"),
+                ProgressEvent(stage=PipelineStage.SOLVE, message="Assigned 2/2 (avg 93%)", percent=100.0),
+            ],
+        )
+        assert values == sorted(values)  # never jumps backwards
+        assert values[0] == 10  # probe done -> 10 % of the whole scan
+        assert values[2] == 40  # subtitles at 50 % -> 10+15+0.5*30
+        assert values[-1] == 100
+        assert "SOLVE" in view._progress_caption.text().upper()
+
+    def test_events_without_percent_never_reset_the_bar(self, qapp: QApplication, ui_context: AppContext) -> None:
+        from episodematch.core.models import PipelineStage, ProgressEvent
+
+        view = WorkspaceView(ui_context)
+        values = self._emit(
+            view,
+            [
+                ProgressEvent(stage=PipelineStage.PROBE, message="Probed a.mkv", percent=100.0),
+                ProgressEvent(stage=PipelineStage.SOLVE, message="TheDiscDB already conclusive"),
+            ],
+        )
+        assert values == [10, 10]
+
+    def test_pillar_report_shows_visible_activity(self, qapp: QApplication, ui_context: AppContext) -> None:
+        view = WorkspaceView(ui_context)
+        view._on_pillar_report("title_t02.mkv", "subtitles", "ok", "561 lines")
+        text = view._activity_caption.text()
+        assert "title_t02.mkv" in text and "subtitles" in text
+
+    def test_finished_caption_reports_summary(self, qapp: QApplication, ui_context: AppContext) -> None:
+        view = WorkspaceView(ui_context)
+        view._on_scan_finished(make_report())
+        caption = view._progress_caption.text()
+        assert "Done" in caption

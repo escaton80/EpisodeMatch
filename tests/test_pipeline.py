@@ -130,7 +130,12 @@ def build_pipeline(config: AppConfig, **overrides: Any) -> Pipeline:
         "frame_scanner": overrides.get("frame_scanner"),
         "llm_arbiter": overrides.get("llm_arbiter"),
     }
-    return Pipeline(config, database=overrides.get("database"), **services)
+    return Pipeline(
+        config,
+        database=overrides.get("database"),
+        progress=overrides.get("progress"),
+        **services,
+    )
 
 
 class TestPipelineFastPath:
@@ -551,3 +556,71 @@ class TestSeasonRangeReleaseMatching:
     def test_no_match_falls_back_to_all_folders(self) -> None:
         client = self._FakeClient(["complete-series-blu-ray"])
         assert Pipeline._disc_release_folders(client, "x", 8) == ["complete-series-blu-ray"]
+
+class TestProgressPerFile:
+    """The GUI progress bar must keep moving through the deep stages — each
+    file reports its stage-local percent and the file currently being worked
+    on, instead of only the initial probe showing percentages."""
+
+    def test_visual_stage_reports_percent_per_file(
+        self,
+        config: AppConfig,
+        rip_folder: Path,
+        thediscdb_repo: Path,
+    ) -> None:
+        mkv1 = make_mkv("title_t00.mkv", mpls="00800.mpls", duration=42 * 60 + 30, size=2_028_000_000)
+        mkv2 = make_mkv("title_t01.mkv", mpls="00801.mpls", duration=41 * 60 + 55, size=2_011_000_000)
+        events: list[ProgressEvent] = []
+
+        class FakeVisual:
+            def scan(self, mkv_path, *, duration_seconds=None, max_frames=None):  # noqa: ANN001, ANN202
+                return []
+
+        pipeline = build_pipeline(
+            config,
+            ffprobe=FakeFfprobe({"title_t00.mkv": mkv1, "title_t01.mkv": mkv2}),
+            disc_db_client=LocalDiscDbImporter(thediscdb_repo),
+            tmdb=FakeTmdb(make_guide()),
+            frame_scanner=FakeVisual(),
+            progress=events.append,
+        )
+        pipeline.scan_folder(
+            rip_folder,
+            series="Test Show",
+            season=1,
+            options=ScanOptions(depth="deep", use_subtitles=False, use_audio=False, use_llm=False),
+        )
+        percent_events = [e for e in events if e.stage.value == "visual" and e.percent is not None]
+        assert len(percent_events) >= 2
+        percents = [e.percent for e in percent_events]
+        assert percents == sorted(percents) and percents[-1] == 100.0
+        assert all(e.file_name for e in percent_events)
+        assert any("title_t01.mkv" in e.message for e in percent_events)
+
+    def test_subtitles_stage_reports_percent_per_file(
+        self,
+        config: AppConfig,
+        rip_folder: Path,
+        thediscdb_repo: Path,
+    ) -> None:
+        mkv1 = make_mkv("title_t00.mkv", mpls="00800.mpls", duration=42 * 60 + 30, size=2_028_000_000)
+        mkv2 = make_mkv("title_t01.mkv", mpls="00801.mpls", duration=41 * 60 + 55, size=2_011_000_000)
+        events: list[ProgressEvent] = []
+        pipeline = build_pipeline(
+            config,
+            ffprobe=FakeFfprobe({"title_t00.mkv": mkv1, "title_t01.mkv": mkv2}),
+            disc_db_client=LocalDiscDbImporter(thediscdb_repo),
+            tmdb=FakeTmdb(make_guide()),
+            progress=events.append,
+        )
+        pipeline.scan_folder(
+            rip_folder,
+            series="Test Show",
+            season=1,
+            options=ScanOptions(depth="deep", use_subtitles=True, use_audio=False, use_llm=False),
+        )
+        percent_events = [e for e in events if e.stage.value == "subtitles" and e.percent is not None]
+        assert percent_events, "subtitles stage must emit per-file percent"
+        percents = [e.percent for e in percent_events]
+        assert percents == sorted(percents) and percents[-1] == 100.0
+        assert all(e.file_name for e in percent_events)
