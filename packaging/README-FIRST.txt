@@ -17,22 +17,23 @@ fully expect that things might fail or not work on your setup.
   taken for mangled filenames or broken MKV headers.
 
 CONTENTS
-  Each archive ships ONE executable directly at the archive root:
-    EpisodeMatch-CLI-v*.zip  ->  episodematch.exe  (console CLI)
-    EpisodeMatch-GUI-v*.zip  ->  EpisodeMatch.exe  (Windows-11 GUI)
+  This archive ships ONE executable directly at the archive root:
+    episodematch.exe   console CLI (match, check-env, fetch-tools, ...)
   The "_internal" folder belongs to the executable - keep it in place.
   bin/ and data/ are created/used NEXT TO the executable.
-  Extract the CLI and GUI archives into SEPARATE folders (both contain an
-  "_internal" directory and would clash when unpacked into the same one).
+  (The separate EpisodeMatch-GUI-v*.zip ships the Windows-11 GUI; extract
+  the two archives into SEPARATE folders - both contain an "_internal"
+  directory and would clash when unpacked into the same one.)
 
-FIRST RUN
+FIRST RUN (console)
 1. Extract this archive to a permanent folder (e.g. D:\EpisodeMatch).
 2. Run:  episodematch.exe fetch-tools
    (downloads ffmpeg, MKVToolNix and SeConv into .\bin - roughly 400 MB)
-3. Put your API keys into data\config.json (see the GitHub README):
+3. Create data\config.json with your API keys (see the GitHub README):
      - TMDB key (required, free at themoviedb.org)
      - SubDL or OpenSubtitles key (for the Subtitles pillar)
-4. Run:  EpisodeMatch.exe   (or use the CLI "match" command)
+4. Run:  episodematch.exe match "D:\Rips\Show S01" --series "Show" --season 1
+   (episodematch.exe check-env shows the tool/OCR/key status first)
 
 Full documentation: https://github.com/escaton80/EpisodeMatch#readme
 

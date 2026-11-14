@@ -80,7 +80,8 @@ class TestBuildReleaseZip:
         monkeypatch.setattr(build_exe, "PROJECT_ROOT", tmp_path)
         # minimal packaging files in the fake project root
         (tmp_path / "packaging").mkdir()
-        (tmp_path / "packaging" / "README-FIRST.txt").write_text("beta note", encoding="utf-8")
+        (tmp_path / "packaging" / "README-FIRST.txt").write_text("beta note (CLI)", encoding="utf-8")
+        (tmp_path / "packaging" / "README-FIRST-GUI.txt").write_text("beta note (GUI)", encoding="utf-8")
         (tmp_path / "packaging" / "THIRD_PARTY_LICENSES.txt").write_text("LGPL-3.0-only: PySide6", encoding="utf-8")
         licenses = tmp_path / "packaging" / "LICENSES"
         licenses.mkdir()
@@ -105,6 +106,8 @@ class TestBuildReleaseZip:
             assert not [n for n in names if "/cli/" in n or "/gui/" in n]
             assert f"{cli_root}/LICENSE" in names  # audit F3
             assert f"{cli_root}/README-FIRST.txt" in names
+            cli_readme = zf.read(f"{cli_root}/README-FIRST.txt").decode("utf-8")
+            assert cli_readme == "beta note (CLI)"  # CLI archive ships the CLI variant
             assert f"{cli_root}/THIRD_PARTY_LICENSES.txt" in names
             assert f"{cli_root}/LICENSES/LGPL-3.0-only.txt" in names
             assert f"{cli_root}/bin/.gitkeep" in names
@@ -117,6 +120,19 @@ class TestBuildReleaseZip:
             assert not [n for n in names if "/cli/" in n or "/gui/" in n]
             assert f"{gui_root}/LICENSE" in names
             assert f"{gui_root}/data/.gitkeep" in names
+            gui_readme = zf.read(f"{gui_root}/README-FIRST.txt").decode("utf-8")
+            assert gui_readme == "beta note (GUI)"  # GUI archive ships the GUI variant
+
+    def test_readme_variants_content(self) -> None:
+        """The REAL packaging READMEs: CLI gets the console flow, GUI gets the
+        Settings-page flow (fetch-tools button, API keys in Settings)."""
+        packaging = Path(build_exe.PROJECT_ROOT) / "packaging"
+        cli_readme = (packaging / "README-FIRST.txt").read_text(encoding="utf-8")
+        gui_readme = (packaging / "README-FIRST-GUI.txt").read_text(encoding="utf-8")
+        assert "episodematch.exe fetch-tools" in cli_readme
+        assert "Fetch missing tools" not in cli_readme  # GUI-only button
+        assert "Settings" in gui_readme and "Fetch missing tools" in gui_readme
+        assert "episodematch.exe fetch-tools" not in gui_readme  # GUI variant: no console steps
 
     def test_zip_build_fails_on_gpl_tool_in_bundle(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         cli, gui = self._fake_bundles(tmp_path)

@@ -153,7 +153,6 @@ def build_release_zip() -> list[Path]:
                 + ", ".join(str(p) for p in forbidden)
             )
 
-    readme_first = PROJECT_ROOT / "packaging" / "README-FIRST.txt"
     third_party = PROJECT_ROOT / "packaging" / "THIRD_PARTY_LICENSES.txt"
     lgpl_text = PROJECT_ROOT / "packaging" / "LICENSES" / "LGPL-3.0-only.txt"
     license_file = PROJECT_ROOT / "LICENSE"
@@ -163,6 +162,11 @@ def build_release_zip() -> list[Path]:
     for label, bundle_root in (("CLI", cli_root), ("GUI", gui_root)):
         zip_path = PROJECT_ROOT / "dist" / f"EpisodeMatch-{label}-v{version}-win64.zip"
         zip_root = f"EpisodeMatch-{label}-v{version}-win64"
+        # Each archive ships its OWN first-run instructions: GUI archives get
+        # the Settings-page flow, CLI archives the console flow.
+        readme_first = PROJECT_ROOT / "packaging" / (
+            "README-FIRST-GUI.txt" if label == "GUI" else "README-FIRST.txt"
+        )
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
             zf.writestr(f"{zip_root}/README-FIRST.txt", readme_first.read_text(encoding="utf-8"))
             zf.writestr(f"{zip_root}/THIRD_PARTY_LICENSES.txt", third_party.read_text(encoding="utf-8"))
