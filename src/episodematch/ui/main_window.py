@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QFrame,
@@ -23,7 +24,7 @@ from episodematch.core.config import AppConfig, ConfigStore
 from episodematch.core.database import CacheDatabase
 from episodematch.core.exceptions import EpisodeMatchError
 from episodematch.ui.context import AppContext
-from episodematch.ui.theme import Icon, Palette, apply_theme, apply_windows11_chrome
+from episodematch.ui.theme import Icon, Palette, app_icon_path, apply_theme, apply_windows11_chrome
 from episodematch.ui.views.postprocess_view import PostprocessView
 from episodematch.ui.views.settings_view import SettingsView
 from episodematch.ui.views.visual_verify_view import VisualVerifyView
@@ -60,6 +61,9 @@ class FluentWindow(QMainWindow):
         super().__init__(parent)
         self._context = context or create_app_context()
         self.setWindowTitle(f"{__app_name__} {__version__}")
+        icon_path = app_icon_path()
+        if icon_path is not None:
+            self.setWindowIcon(QIcon(str(icon_path)))
         self.resize(1280, 820)
         self.setMinimumSize(980, 640)
 
@@ -200,6 +204,9 @@ def run_gui(
     """
     app = QApplication.instance() or QApplication([])
     apply_theme(app)
+    gui_icon = app_icon_path()
+    if gui_icon is not None:
+        app.setWindowIcon(QIcon(str(gui_icon)))
     window = FluentWindow(create_app_context(config, config_path=config_path))
     if smoke:
         from PySide6.QtCore import QTimer

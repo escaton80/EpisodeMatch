@@ -88,24 +88,29 @@ class TestBuildReleaseZip:
 
         (tmp_path / "LICENSE").write_text("MIT License\nCopyright ...", encoding="utf-8")
 
+        version = build_exe._app_version()
+        cli_zip_name = f"EpisodeMatch-CLI-v{version}-win64.zip"
+        gui_zip_name = f"EpisodeMatch-GUI-v{version}-win64.zip"
         zip_paths = build_exe.build_release_zip()
-        assert [p.name for p in zip_paths] == ["EpisodeMatch-CLI-v0.11.0-win64.zip", "EpisodeMatch-GUI-v0.11.0-win64.zip"]
+        assert [p.name for p in zip_paths] == [cli_zip_name, gui_zip_name]
         by_name = {p.name: p for p in zip_paths}
-        with zipfile.ZipFile(by_name["EpisodeMatch-CLI-v0.11.0-win64.zip"]) as zf:
+        cli_root = f"EpisodeMatch-CLI-v{version}-win64"
+        gui_root = f"EpisodeMatch-GUI-v{version}-win64"
+        with zipfile.ZipFile(by_name[cli_zip_name]) as zf:
             names = zf.namelist()
-            assert "EpisodeMatch-CLI-v0.11.0-win64/cli/episodematch/episodematch.exe" in names
-            assert "EpisodeMatch-CLI-v0.11.0-win64/LICENSE" in names  # audit F3
-            assert "EpisodeMatch-CLI-v0.11.0-win64/README-FIRST.txt" in names
-            assert "EpisodeMatch-CLI-v0.11.0-win64/THIRD_PARTY_LICENSES.txt" in names
-            assert "EpisodeMatch-CLI-v0.11.0-win64/LICENSES/LGPL-3.0-only.txt" in names
-            assert "EpisodeMatch-CLI-v0.11.0-win64/bin/.gitkeep" in names
+            assert f"{cli_root}/cli/episodematch/episodematch.exe" in names
+            assert f"{cli_root}/LICENSE" in names  # audit F3
+            assert f"{cli_root}/README-FIRST.txt" in names
+            assert f"{cli_root}/THIRD_PARTY_LICENSES.txt" in names
+            assert f"{cli_root}/LICENSES/LGPL-3.0-only.txt" in names
+            assert f"{cli_root}/bin/.gitkeep" in names
             assert not [n for n in names if n.lower().endswith("ffmpeg.exe")]
             assert not [n for n in names if "config.json" in n]
-        with zipfile.ZipFile(by_name["EpisodeMatch-GUI-v0.11.0-win64.zip"]) as zf:
+        with zipfile.ZipFile(by_name[gui_zip_name]) as zf:
             names = zf.namelist()
-            assert "EpisodeMatch-GUI-v0.11.0-win64/gui/EpisodeMatch/EpisodeMatch.exe" in names
-            assert "EpisodeMatch-GUI-v0.11.0-win64/LICENSE" in names
-            assert "EpisodeMatch-GUI-v0.11.0-win64/data/.gitkeep" in names
+            assert f"{gui_root}/gui/EpisodeMatch/EpisodeMatch.exe" in names
+            assert f"{gui_root}/LICENSE" in names
+            assert f"{gui_root}/data/.gitkeep" in names
             assert not [n for n in names if "cli/episodematch" in n]  # GUI zip ships no CLI
 
     def test_zip_build_fails_on_gpl_tool_in_bundle(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -148,3 +153,43 @@ class TestThirdPartyLicensesFile:
         assert "PySide6" in text and "LGPL-3.0-only" in text
         assert "NOT PART OF THIS ARCHIVE" in text  # GPL tools disclaimer
         assert (root / "packaging" / "LICENSES" / "LGPL-3.0-only.txt").is_file()
+
+class TestPyInstallerIconWiring:
+    def test_run_pyinstaller_passes_icon_and_add_data(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: list[list[str]] = []
+
+        def fake_run(command, **kwargs):  # noqa: ANN001, ANN202
+            captured.append(list(command))
+
+            class R:
+                returncode = 0
+
+            return R()
+
+        monkeypatch.setattr(build_exe.subprocess, "run", fake_run)
+        icon = tmp_path / "logo" / "episode_match.ico"
+        icon.parent.mkdir()
+        icon.write_bytes(b"ico")
+        build_exe.run_pyinstaller(
+            "episodematch",
+            console=True,
+            entry="packaging/cli_entry.py",
+            distpath=str(tmp_path / "d"),
+            workpath=str(tmp_path / "w"),
+            icon=icon,
+            add_data=[("logo", "assets")],
+        )
+        command = captured[0]
+        assert "--icon" in command and str(icon) in command
+        add_flag = command[command.index("--add-data") + 1]
+        assert "assets" in add_flag and "logo" in add_flag.lower()
+
+    def test_logo_assets_discovery(self, tmp_path: Path) -> None:
+        logo = tmp_path / "logo"
+        logo.mkdir()
+        assert build_exe._logo_assets(logo) == (None, None)  # nothing there yet
+        (logo / "episode_match.ico").write_bytes(b"ico")
+        (logo / "episode_match.jpg").write_bytes(b"jpg")
+        icon, window_image = build_exe._logo_assets(logo)
+        assert icon is not None and icon.suffix == ".ico"
+        assert window_image is not None and window_image.suffix == ".jpg"

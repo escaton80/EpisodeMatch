@@ -24,7 +24,16 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-def run_pyinstaller(name: str, *, console: bool, entry: str, distpath: str, workpath: str) -> None:
+def run_pyinstaller(
+    name: str,
+    *,
+    console: bool,
+    entry: str,
+    distpath: str,
+    workpath: str,
+    icon: Path | None = None,
+    add_data: list[tuple[str, str]] | None = None,
+) -> None:
     command = [
         sys.executable,
         "-m", "PyInstaller",
@@ -38,10 +47,24 @@ def run_pyinstaller(name: str, *, console: bool, entry: str, distpath: str, work
         "--specpath", workpath,  # keep the generated .spec out of the project root
         entry,
     ]
+    if icon is not None:
+        command += ["--icon", str(icon)]
+    for source, destination in (add_data or []):
+        command += ["--add-data", f"{source}{os.pathsep}{destination}"]
     print("+", " ".join(command), flush=True)
     completed = subprocess.run(command, cwd=str(PROJECT_ROOT), check=False)
     if completed.returncode != 0:
         raise SystemExit(f"PyInstaller failed for {name} (exit {completed.returncode})")
+
+
+def _logo_assets(logo_dir: Path) -> tuple[Path | None, Path | None]:
+    """Discover the EXE icon (.ico) and window image (.jpg/.png) in logo/."""
+    icon = next(iter(sorted(logo_dir.glob("*.ico"))), None) if logo_dir.is_dir() else None
+    image = next(
+        iter(sorted(logo_dir.glob("*.jpg")) + sorted(logo_dir.glob("*.png"))),
+        None,
+    ) if logo_dir.is_dir() else None
+    return icon, image
 
 
 def smoke_test(gui_exe: Path, cli_exe: Path) -> None:
@@ -165,8 +188,28 @@ def main() -> int:
     args = parser.parse_args()
 
     os.chdir(PROJECT_ROOT)
-    run_pyinstaller("episodematch", console=True, entry="packaging/cli_entry.py", distpath="dist/cli", workpath="build/cli")
-    run_pyinstaller("EpisodeMatch", console=False, entry="packaging/gui_entry.py", distpath="dist/gui", workpath="build/gui")
+    logo_dir = PROJECT_ROOT / "logo"
+    exe_icon, window_image = _logo_assets(logo_dir)
+    # PyInstaller resolves --add-data sources relative to --specpath, so the
+    # source must be absolute; "assets" is the bundle-relative destination.
+    gui_add_data = [(str(logo_dir), "assets")] if window_image is not None else []
+    run_pyinstaller(
+        "episodematch",
+        console=True,
+        entry="packaging/cli_entry.py",
+        distpath="dist/cli",
+        workpath="build/cli",
+        icon=exe_icon,
+    )
+    run_pyinstaller(
+        "EpisodeMatch",
+        console=False,
+        entry="packaging/gui_entry.py",
+        distpath="dist/gui",
+        workpath="build/gui",
+        icon=exe_icon,
+        add_data=gui_add_data,
+    )
 
     cli_exe = PROJECT_ROOT / "dist" / "cli" / "episodematch" / "episodematch.exe"
     gui_exe = PROJECT_ROOT / "dist" / "gui" / "EpisodeMatch" / "EpisodeMatch.exe"

@@ -579,3 +579,34 @@ class TestShutdownHandshake:
         win.close()
         qapp.processEvents()
         assert ui_context.database.is_closed
+
+class TestAppIcon:
+    """The program logo (logo/) becomes the window/taskbar icon; frozen builds
+    resolve it from the PyInstaller bundle (assets/)."""
+
+    def test_dev_icon_found_in_repo_logo_dir(self) -> None:
+        from episodematch.ui.theme import app_icon_path
+
+        icon = app_icon_path()
+        assert icon is not None and icon.is_file()
+        assert "logo" in str(icon).lower()
+
+    def test_fluent_window_uses_app_icon(self, qapp: QApplication, ui_context: AppContext) -> None:
+        win = FluentWindow(ui_context)
+        try:
+            assert not win.windowIcon().isNull()
+        finally:
+            win.close()
+
+    def test_frozen_resolves_bundled_assets(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        import sys as _sys
+
+        from episodematch.ui.theme import app_icon_path
+
+        assets = tmp_path / "assets"
+        assets.mkdir()
+        (assets / "episode_match.jpg").write_bytes(b"fake jpg")
+        monkeypatch.setattr(_sys, "frozen", True, raising=False)
+        monkeypatch.setattr(_sys, "_MEIPASS", str(tmp_path), raising=False)
+        icon = app_icon_path()
+        assert icon == assets / "episode_match.jpg"

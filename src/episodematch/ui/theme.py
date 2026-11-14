@@ -8,6 +8,7 @@ radii, accent fills, 2 px input focus affordances and slim rounded scrollbars.
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
@@ -580,6 +581,36 @@ QFrame#EvidenceCard {{
 # ---------------------------------------------------------------------------
 # Windows 11 DWM helpers (dark title bar + Mica backdrop), via ctypes
 # ---------------------------------------------------------------------------
+
+
+def app_icon_path() -> Path | None:
+    """Locate the program logo for the window/taskbar icon (or None).
+
+    Frozen builds bundle ``logo/`` via PyInstaller ``--add-data`` and resolve
+    it from ``sys._MEIPASS/assets``; development runs use the repo's
+    ``logo/`` folder. Optional — the app runs fine without a logo.
+    """
+    candidates: list[Path] = []
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", "")
+        base = Path(meipass) if meipass else Path(sys.executable).parent
+        candidates += [
+            base / "assets" / "episode_match.jpg",
+            base / "assets" / "episode_match.png",
+            base / "assets" / "episode_match.ico",
+            Path(sys.executable).parent / "logo" / "episode_match.jpg",
+        ]
+    else:
+        repo_root = Path(__file__).resolve().parents[3]
+        candidates += [
+            repo_root / "logo" / "episode_match.jpg",
+            repo_root / "logo" / "episode_match.png",
+            repo_root / "logo" / "episode_match.ico",
+        ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def apply_windows11_chrome(window) -> bool:  # noqa: ANN001 - QWidget
