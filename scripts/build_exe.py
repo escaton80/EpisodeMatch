@@ -173,10 +173,11 @@ def build_release_zip() -> list[Path]:
                 zf.write(lgpl_text, f"{zip_root}/LICENSES/LGPL-3.0-only.txt")
             zf.writestr(f"{zip_root}/bin/.gitkeep", "")
             zf.writestr(f"{zip_root}/data/.gitkeep", "")
-            arc_dir = "cli/episodematch" if label == "CLI" else "gui/EpisodeMatch"
+            # Flat layout: the executable sits directly in the archive root
+            # with bin/ and data/ as siblings (no nested cli/ or gui/ folder).
             for p in bundle_root.rglob("*"):
                 if p.is_file():
-                    zf.write(p, f"{zip_root}/{arc_dir}/" + p.relative_to(bundle_root).as_posix())
+                    zf.write(p, f"{zip_root}/" + p.relative_to(bundle_root).as_posix())
         zips.append(zip_path)
     return zips
 

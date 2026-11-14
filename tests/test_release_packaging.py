@@ -98,7 +98,11 @@ class TestBuildReleaseZip:
         gui_root = f"EpisodeMatch-GUI-v{version}-win64"
         with zipfile.ZipFile(by_name[cli_zip_name]) as zf:
             names = zf.namelist()
-            assert f"{cli_root}/cli/episodematch/episodematch.exe" in names
+            # The executable sits DIRECTLY in the archive root, with bin/ and
+            # data/ as siblings (user request: no nested cli/episodematch/).
+            assert f"{cli_root}/episodematch.exe" in names
+            assert f"{cli_root}/_internal/python312.dll" in names
+            assert not [n for n in names if "/cli/" in n or "/gui/" in n]
             assert f"{cli_root}/LICENSE" in names  # audit F3
             assert f"{cli_root}/README-FIRST.txt" in names
             assert f"{cli_root}/THIRD_PARTY_LICENSES.txt" in names
@@ -108,10 +112,11 @@ class TestBuildReleaseZip:
             assert not [n for n in names if "config.json" in n]
         with zipfile.ZipFile(by_name[gui_zip_name]) as zf:
             names = zf.namelist()
-            assert f"{gui_root}/gui/EpisodeMatch/EpisodeMatch.exe" in names
+            assert f"{gui_root}/EpisodeMatch.exe" in names
+            assert f"{gui_root}/_internal/Qt6Core.dll" in names
+            assert not [n for n in names if "/cli/" in n or "/gui/" in n]
             assert f"{gui_root}/LICENSE" in names
             assert f"{gui_root}/data/.gitkeep" in names
-            assert not [n for n in names if "cli/episodematch" in n]  # GUI zip ships no CLI
 
     def test_zip_build_fails_on_gpl_tool_in_bundle(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         cli, gui = self._fake_bundles(tmp_path)
