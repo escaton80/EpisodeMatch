@@ -15,6 +15,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass, field
+from typing import Sequence
 
 import numpy as np
 from rapidfuzz import fuzz, process
@@ -156,6 +157,53 @@ def best_line_match(
     return best
 
 
+def build_reference_line_weights(references: Sequence[Transcript]) -> dict[str, float] | None:
+    """Line-level IDF across the loaded candidate references (review 4.1).
+
+    Show-generic lines appear in EVERY candidate's reference and therefore carry
+    zero discriminating information — their weight is 0.0. Discriminative lines
+    (present in only one reference) get the full ``log(N / occurrences)``.
+
+    Returns ``None`` when fewer than **3 non-empty references** are loaded —
+    with two candidates everything is either universal or unique and the IDF
+    would be meaningless. The caller keeps the coverage unweighted in that case.
+    """
+    non_empty = [ref for ref in references if meaningful_lines(ref.lines)]
+    if len(non_empty) < 3:
+        return None
+    docs = [{normalize_dialog_text(line) for line in meaningful_lines(ref.lines)} for ref in non_empty]
+    counts: dict[str, int] = {}
+    for doc in docs:
+        for normalized in doc:
+            counts[normalized] = counts.get(normalized, 0) + 1
+    total = len(docs)
+    return {normalized: math.log(total / occurrences) for normalized, occurrences in counts.items()}
+
+
+def check_reference_sync(
+    transcript: Transcript,
+    reference: Transcript,
+    *,
+    threshold: float = 20.0,
+) -> float | None:
+    """Compare cue timing of the file's own track against the downloaded
+    reference (review 4.2).
+
+    Returns the deviation in seconds when it exceeds ``threshold`` — a
+    reference timed to a retail release (WEB-DL/BluRay) sits shifted relative
+    to the disc, and a different CUT loses lines legitimately. ``None`` when the
+    cues align (or either transcript is empty).
+    """
+    own = [line for line in transcript.lines if line.text.strip()]
+    ref = [line for line in reference.lines if line.text.strip()]
+    if not own or not ref:
+        return None
+    offset_start = abs(own[0].start_seconds - ref[0].start_seconds)
+    offset_end = abs(own[-1].end_seconds - ref[-1].end_seconds)
+    offset = max(offset_start, offset_end)
+    return offset if offset > threshold else None
+
+
 @dataclass
 class DialogAlignment:
     """Coverage-based alignment of extracted lines against reference lines."""
@@ -179,6 +227,7 @@ def align_dialogs(
     score_cutoff: float = 40.0,
     strong_cutoff: float = 80.0,
     coverage_target: float = 0.40,
+    line_weights: dict[str, float] | None = None,
 ) -> DialogAlignment:
     """Coverage-based dialog scoring (the discriminative pillar-2 measure).
 
@@ -187,6 +236,12 @@ def align_dialogs(
     full unique reference size? A wrong episode only produces generic collisions
     (~15-20%, recap lines etc.); the true episode confirms most of its own
     dialog. Matches below the cutoff are ignored entirely.
+
+    Review 4.1: ``line_weights`` (from :func:`build_reference_line_weights`)
+    weight each reference line by its IDF across the candidate references —
+    show-generic lines carry weight 0 and drop out of BOTH the numerator and
+    the denominator, killing the generic-collision floor. Without weights the
+    coverage stays the plain confirmed/total ratio.
 
     The similarity matrix is computed with ``rapidfuzz.process.cdist`` (C++,
     parallel) — a full film (~500 lines) against a full reference (~500 lines)
@@ -210,7 +265,23 @@ def align_dialogs(
     best_per_ref = np.asarray(matrix).max(axis=0)
     covered_mask = best_per_ref >= strong_cutoff
     confirmed = int(covered_mask.sum())
-    coverage = confirmed / denominator
+    if line_weights is None:
+        coverage = confirmed / denominator
+    else:
+        ref_weights = [
+            line_weights.get(normalize_dialog_text(ref), 1.0) for ref in unique_refs
+        ]
+        total_weight = sum(ref_weights)
+        if total_weight <= 0:
+            # Every reference line is show-generic — nothing discriminates.
+            return DialogAlignment(
+                score=0.0,
+                unmatched_count=len(extracted_lines),
+                coverage=0.0,
+                confirmed_refs=confirmed,
+                reference_size=denominator,
+            )
+        coverage = sum(w for w, covered in zip(ref_weights, covered_mask) if covered) / total_weight
     mean_score = (float(best_per_ref[covered_mask].mean()) / 100.0) if confirmed else 0.0
     score = min(1.0, coverage / coverage_target) * (0.7 + 0.3 * mean_score)
 
@@ -255,6 +326,9 @@ class TextScore:
     matched_pairs: list[tuple[str, str, float]] = field(default_factory=list)
     language_mismatch: str | None = None  # e.g. "de vs en" when dialog scoring was skipped
     coverage: float = 0.0  # share of the candidate's reference dialog confirmed
+    # Review 4.2: cue-timing deviation of the reference against the file's own
+    # track (> 20 s means "different master", not "wrong episode").
+    sync_offset_seconds: float | None = None
 
     @property
     def summary(self) -> str:
@@ -273,6 +347,7 @@ def score_episode(
     *,
     reference_transcript: Transcript | None,
     dialog_cutoff: float = 40.0,
+    line_weights: dict[str, float] | None = None,
 ) -> TextScore:
     """Score one transcript against one candidate episode.
 
@@ -307,14 +382,18 @@ def score_episode(
         )
 
     extracted = meaningful_lines(transcript.lines)
+    sync_offset_seconds: float | None = None
     if reference_transcript is None or language_mismatch:
         dialog_score = 0.0
         pairs: list[tuple[str, str, float]] = []
         coverage = 0.0
         final = 0.35 * plot_score
     else:
+        # Review 4.2: a reference timed to another master is reported, not
+        # silently punished — the score stays, the verdict is tagged.
+        sync_offset_seconds = check_reference_sync(transcript, reference_transcript)
         reference = meaningful_lines(reference_transcript.lines)
-        alignment = align_dialogs(extracted, reference, score_cutoff=dialog_cutoff)
+        alignment = align_dialogs(extracted, reference, score_cutoff=dialog_cutoff, line_weights=line_weights)
         dialog_score = alignment.score
         pairs = alignment.matched_pairs
         coverage = alignment.coverage
@@ -329,4 +408,5 @@ def score_episode(
         matched_pairs=pairs[:6],
         language_mismatch=language_mismatch,
         coverage=coverage,
+        sync_offset_seconds=sync_offset_seconds,
     )

@@ -87,6 +87,10 @@ class DiscTitleEntry:
     item_type: str | None
     season: int | None
     episode: int | None
+    # Review 1.1: contributors hand-enter Item.Episode as free text — a
+    # two-part story on ONE playlist is published as "1-2". episode stays the
+    # START of the span; episode_end carries the covered last episode.
+    episode_end: int | None = None
     comment: str | None = None
 
     @property
@@ -123,6 +127,15 @@ def parse_disc_json(payload: dict, *, series_title: str, release_title: str, sou
         mpls_match = _MPLS_RE.search(str(source_file)) if source_file else None
         season = item.get("Season")
         episode = item.get("Episode")
+        # Review 1.1: "1-2" means one playlist covering episodes 1 AND 2 —
+        # _safe_int alone would drop the entry entirely.
+        episode_int = _safe_int(episode, default=None)
+        episode_end_int: int | None = None
+        if episode_int is None and episode is not None:
+            range_match = _EPISODE_RANGE_RE.match(str(episode))
+            if range_match:
+                episode_int = int(range_match.group(1))
+                episode_end_int = int(range_match.group(2))
         titles.append(
             DiscTitleEntry(
                 make_mkv_index=_safe_int(raw.get("Index"), default=index),
@@ -130,10 +143,11 @@ def parse_disc_json(payload: dict, *, series_title: str, release_title: str, sou
                 segment_map=str(raw["SegmentMap"]) if raw.get("SegmentMap") is not None else None,
                 duration_seconds=duration,
                 size_bytes=_safe_int(raw.get("Size"), default=None),
-                episode_title=item.get("Title"),
+                episode_title=_normalize_disc_title(item.get("Title")),
                 item_type=item.get("Type"),
                 season=_safe_int(season, default=None),
-                episode=_safe_int(episode, default=None),
+                episode=episode_int,
+                episode_end=episode_end_int,
                 comment=str(raw["Comment"]) if raw.get("Comment") else None,
             )
         )
@@ -154,6 +168,28 @@ def parse_disc_json(payload: dict, *, series_title: str, release_title: str, sou
 def parse_release_json(payload: dict) -> str | None:
     """Extract the UPC from a release.json document."""
     return payload.get("Upc") or payload.get("UPC")
+
+
+_EPISODE_RANGE_RE = re.compile(r"^\s*(\d{1,3})\s*[-–]\s*(\d{1,3})\s*$")
+
+#: Review 1.2: some contributors paste a suggested FILENAME into Item.Title.
+#: The rewrite is gated on an actual media extension inside the string, so a
+#: genuine title that merely contains dots stays untouched.
+_FILENAME_TITLE_PREFIX_RE = re.compile(r"^.*?\.S\d{1,3}\.?E\d{1,3}\.", re.IGNORECASE)
+_MEDIA_EXT_RE = re.compile(r"\.(mkv|mp4|avi|m2ts|ts)\b", re.IGNORECASE)
+
+
+def _normalize_disc_title(title: Any) -> Any:
+    """Strip a suggested filename down to its real episode title (or pass through)."""
+    if title is None:
+        return None
+    text = str(title).strip()
+    if not text or not _MEDIA_EXT_RE.search(text):
+        return title  # gate: no extension -> no rewrite (audit against dotted titles)
+    stripped = _FILENAME_TITLE_PREFIX_RE.sub("", text)
+    stripped = re.sub(r"\.(mkv|mp4|avi|m2ts|ts)$", "", stripped, flags=re.IGNORECASE)
+    cleaned = stripped.strip(" ._-")
+    return cleaned if cleaned else title
 
 
 def _safe_int(value: Any, *, default: int | None) -> int | None:
@@ -185,11 +221,54 @@ class PlaylistMatch:
     def episode(self) -> int | None:
         return self.entry.episode
 
+    @property
+    def episode_end(self) -> int | None:
+        return self.entry.episode_end
+
 
 def _duration_close(a: float | None, b: float | None, tolerance: float) -> bool:
     if a is None or b is None:
         return False
     return abs(a - b) <= tolerance
+
+
+def disc_key(disc: ParsedDisc) -> str:
+    """Stable identity key for a parsed disc (content-based, not object id)."""
+    return disc.global_disc_id or f"{disc.series_title}/{disc.release_title}/{disc.slug}/{disc.disc_name}"
+
+
+def score_disc_layout(
+    disc: ParsedDisc,
+    fingerprints: list[DiscFingerprint],
+    *,
+    duration_tolerance: float = 2.0,
+) -> float:
+    """Fraction of the disc's episode playlists confirmed by the rip (review 2.2).
+
+    A playlist counts as confirmed when the rip contains a file with a
+    **matching MPLS name AND a matching running time** — either signal alone is
+    ambiguous (every disc has a `00001.mpls`; two episodes can share a length),
+    but together they fingerprint the pressing. 1.0 means every published
+    episode playlist of this disc was ripped as-is.
+    """
+    episode_entries = [entry for entry in disc.titles if entry.is_episode]
+    if not episode_entries:
+        return 0.0
+    confirmed = 0
+    for entry in episode_entries:
+        if entry.mpls_name is None or entry.duration_seconds is None:
+            continue
+        for fingerprint in fingerprints:
+            mpls = fingerprint.mpls_name.lower() if fingerprint.mpls_name else None
+            if mpls != entry.mpls_name:
+                continue
+            if _duration_close(fingerprint.duration_seconds, entry.duration_seconds, duration_tolerance):
+                confirmed += 1
+                break
+    return confirmed / len(episode_entries)
+
+
+_LAYOUT_CONFIRMED_THRESHOLD = 0.8
 
 
 def match_fingerprint(
@@ -199,6 +278,8 @@ def match_fingerprint(
     duration_tolerance: float = 2.0,
     size_tolerance: float = 0.02,
     index_weight: float = 0.25,
+    pinned: bool = False,
+    disc_layout_scores: dict[str, float] | None = None,
 ) -> list[PlaylistMatch]:
     """Score every disc title entry against a ripped file's fingerprint.
 
@@ -217,23 +298,28 @@ def match_fingerprint(
       usually smaller than the on-disc playlist (stripped audio, container
       overhead)
     * segment map count match: +0.05
+
+    Review 2.1: duration uniqueness is counted **per disc** ("unique on its own
+    disc" is what the evidence claims), and the full +0.70 bonus only applies to
+    a *pinned* disc (Disc-URL scan) or one confirmed by the layout gate
+    (``disc_layout_scores``, review 2.2). Unique durations on unpinned,
+    unconfirmed discs are damped (+0.35) so that several unpinned discs cannot
+    each hand out the near-conclusive bonus.
     """
     mpls = fingerprint.mpls_name.lower() if fingerprint.mpls_name else None
     all_entries = [(disc, entry) for disc in discs for entry in disc.titles]
 
-    # How many entries share this file's duration? A unique duration is a much
-    # stronger signal than one colliding among many equal-length episodes.
-    duration_matches = sum(
-        1
-        for _disc, entry in all_entries
-        if _duration_close(fingerprint.duration_seconds, entry.duration_seconds, duration_tolerance)
-    )
-    if duration_matches == 1:
-        duration_weight = 0.60
-    elif duration_matches in (2, 3):
-        duration_weight = 0.35
-    else:
-        duration_weight = 0.20
+    # Review 2.1: count duration matches per disc, not across the loaded set.
+    duration_matches_by_disc: dict[int, int] = {}
+    layout_confirmed_by_disc: dict[int, bool] = {}
+    for disc in discs:
+        duration_matches_by_disc[id(disc)] = sum(
+            1
+            for entry in disc.titles
+            if _duration_close(fingerprint.duration_seconds, entry.duration_seconds, duration_tolerance)
+        )
+        layout_score = (disc_layout_scores or {}).get(disc_key(disc), 0.0)
+        layout_confirmed_by_disc[id(disc)] = layout_score >= _LAYOUT_CONFIRMED_THRESHOLD
 
     matches: list[PlaylistMatch] = []
     for disc, entry in all_entries:
@@ -242,6 +328,8 @@ def match_fingerprint(
         duration_close = _duration_close(
             fingerprint.duration_seconds, entry.duration_seconds, duration_tolerance
         )
+        matches_on_own_disc = duration_matches_by_disc[id(disc)]
+        layout_confirmed = layout_confirmed_by_disc[id(disc)]
         if mpls and entry.mpls_name and mpls == entry.mpls_name:
             score += 0.60
             reasons.append(f"MPLS {entry.mpls_name} matches disc entry")
@@ -271,13 +359,27 @@ def match_fingerprint(
                 )
         if duration_close:
             delta = abs((fingerprint.duration_seconds or 0.0) - (entry.duration_seconds or 0.0))
-            if duration_matches == 1:
-                # Unique on the whole disc: an individual episode runtime is
-                # near-conclusive — no closeness dilution needed.
-                score += 0.70
-                reasons.append(f"Duration {entry.duration_seconds:.0f}s ±{delta:.1f}s (unique on disc)")
+            closeness = max(0.5, 1.0 - (delta / duration_tolerance) * 0.5) if duration_tolerance else 0.5
+            if matches_on_own_disc == 1:
+                # Review 2.1: unique on its own disc. The full bonus only
+                # applies to a pinned disc or one confirmed by the layout gate;
+                # unpinned/unconfirmed discs get the damped bonus so several
+                # unpinned discs cannot each hand out +0.70.
+                if pinned or layout_confirmed:
+                    score += 0.70
+                    qualifier = "layout confirmed" if layout_confirmed else "pinned disc"
+                    reasons.append(
+                        f"Duration {entry.duration_seconds:.0f}s ±{delta:.1f}s "
+                        f"(unique on its own disc, {qualifier})"
+                    )
+                else:
+                    score += 0.35
+                    reasons.append(
+                        f"Duration {entry.duration_seconds:.0f}s ±{delta:.1f}s "
+                        "(unique on its own disc, bonus damped — multiple unpinned discs)"
+                    )
             else:
-                closeness = max(0.5, 1.0 - (delta / duration_tolerance) * 0.5) if duration_tolerance else 0.5
+                duration_weight = 0.35 if matches_on_own_disc in (2, 3) else 0.20
                 score += duration_weight * closeness
                 reasons.append(f"Duration {entry.duration_seconds:.0f}s ±{delta:.1f}s")
         if (
@@ -289,7 +391,9 @@ def match_fingerprint(
             score += 0.10
             reasons.append(f"Size {entry.size_bytes} bytes within {size_tolerance:.0%}")
         if fingerprint.segment_count is not None and entry.segment_map:
-            map_count = len(entry.segment_map.split(","))
+            # Review 2.3: normalize the map string so whitespace variants
+            # ("1-11,12" vs "1-11, 12") don't skew the count comparison.
+            map_count = len([part for part in entry.segment_map.replace(" ", "").split(",") if part])
             if map_count == fingerprint.segment_count:
                 score += 0.05
                 reasons.append(f"Segment count {map_count}")

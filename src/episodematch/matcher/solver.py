@@ -148,6 +148,28 @@ class SolvedAssignment:
         return not self.unassigned
 
 
+def exclude_covered_episodes(episode_numbers: list[int], candidates: list[MatchCandidate]) -> list[int]:
+    """Remove episodes covered by multi-episode (range) candidates.
+
+    Review 1.1: a candidate assigned to a disc entry published as "1-2" contains
+    BOTH episodes — the follow-up episode (E02) must not be assignable to
+    another file. The start episode stays in the list (the candidate scores on
+    it); only strictly-covered follow-ups are excluded.
+    """
+    covered: set[int] = set()
+    for candidate in candidates:
+        end = candidate.episode_end
+        hint = max(
+            (e.episode_hint for e in candidate.evidence if e.episode_hint is not None),
+            default=None,
+        )
+        if end is None or hint is None:
+            continue
+        for episode in range(hint + 1, end + 1):
+            covered.add(episode)
+    return [episode for episode in episode_numbers if episode not in covered]
+
+
 def build_score_matrix(candidates: list[MatchCandidate], episode_numbers: list[int]) -> np.ndarray:
     """Create the (files x episodes) score matrix from accumulated evidence."""
     matrix = np.zeros((len(candidates), len(episode_numbers)), dtype=float)
@@ -220,11 +242,12 @@ def solve_assignment(
             continue
         evidence_sorted = sorted(candidate.evidence, key=lambda item: item.score, reverse=True)
         solved.entries.append(
-            AssignmentEntry(
-                file_path=candidate.file_path,
-                season=season,
-                episode=episode,
-                episode_title=episode_titles.get(episode),
+                AssignmentEntry(
+                    file_path=candidate.file_path,
+                    season=season,
+                    episode=episode,
+                    episode_end=candidate.episode_end,
+                    episode_title=episode_titles.get(episode),
                 confidence=max(0.0, min(max_confidence, score)),
                 methods=sorted({evidence.pillar.value for evidence in candidate.evidence}),
                 reasoning=[evidence.summary for evidence in evidence_sorted[:8] if evidence.summary],

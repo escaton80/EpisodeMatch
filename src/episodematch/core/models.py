@@ -457,6 +457,9 @@ class MatchCandidate(BaseModel):
     # score is the calibrated sum across pillars — multi-pillar reinforcement
     # without intra-pillar double counting.
     pillar_episode_scores: dict[str, dict[int, float]] = Field(default_factory=dict)
+    # Review 1.1: a disc entry published as "1-2" is one file covering two
+    # episodes; the candidate carries the end of that span.
+    episode_end: int | None = None
 
     @field_validator("file_path", mode="before")
     @classmethod
@@ -505,6 +508,8 @@ class AssignmentEntry(BaseModel):
     file_path: Path
     season: int
     episode: int
+    # Review 1.1: end of a multi-episode span ("1-2" -> episode=1, end=2).
+    episode_end: int | None = None
     episode_title: str | None = None
     confidence: float = 0.0
     methods: list[str] = Field(default_factory=list)
@@ -518,7 +523,10 @@ class AssignmentEntry(BaseModel):
 
     @property
     def code(self) -> str:
-        return f"S{self.season:02d}E{self.episode:02d}"
+        code = f"S{self.season:02d}E{self.episode:02d}"
+        if self.episode_end is not None and self.episode_end > self.episode:
+            code += f"-E{self.episode_end:02d}"
+        return code
 
 
 class UnassignedFile(BaseModel):

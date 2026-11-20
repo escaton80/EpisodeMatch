@@ -49,15 +49,21 @@ from episodematch.extractors.ocr_engine import OcrEngine
 from episodematch.extractors.subtitle_extractor import SubtitleExtractor
 from episodematch.matcher.credit_scorer import credit_evidence, score_episode_credits
 from episodematch.matcher.llm_arbiter import LlmArbiter, LlmSettings, merge_verdict_into_candidates
-from episodematch.matcher.solver import solve_assignment
-from episodematch.matcher.text_scorer import score_episode
+from episodematch.matcher.solver import exclude_covered_episodes, solve_assignment
+
+#: Review 1.3: placeholder titles contributors enter instead of a real name
+#: ("Episode 1", "Title 01", "Ep 3") must never override the TMDB title.
+_GENERIC_DISC_TITLE_RE = re.compile(r"^(?:episode|title|ep)\.?\s*\d{1,3}$", re.IGNORECASE)
+from episodematch.matcher.text_scorer import build_reference_line_weights, score_episode
 from episodematch.providers.imdb_scraper import ImdbScraper
 from episodematch.providers.opensubtitles import OpenSubtitlesClient, compute_opensubtitles_hash
 from episodematch.providers.thediscdb import (
     LocalDiscDbImporter,
     ParsedDisc,
     TheDiscDbClient,
+    disc_key,
     match_fingerprint,
+    score_disc_layout,
 )
 from episodematch.providers.tmdb_client import TmdbClient
 
@@ -373,6 +379,9 @@ class Pipeline:
             raise EpisodeMatchError(f"No .mkv files found in {folder}")
 
         report = ScanReport(assignment=SeasonAssignment(series=SeriesInfo(name=series), season=season))
+        # Review 1.3: disc titles collected during the fast stage, used later
+        # for title precedence (disc title beats a different TMDB title).
+        self._disc_episode_titles: dict[int, tuple[MatchCandidate, str]] = {}
         self._progress(PipelineStage.PROBE, f"Probing {len(files)} files…", percent=0.0)
 
         # Stage 1: probe
@@ -404,6 +413,27 @@ class Pipeline:
             )
         report.assignment.series = guide.series
 
+        # Review 1.3: the disc's own title wins over a DIFFERENT TMDB title —
+        # recorded as display-only evidence, and the solver labels the file
+        # with the disc's (broadcast) title.
+        guide_titles = {episode.episode: episode.title for episode in guide.episodes}
+        for episode, (candidate, disc_title) in self._disc_episode_titles.items():
+            guide_title = guide_titles.get(episode)
+            if guide_title is None or disc_title == guide_title:
+                continue
+            candidate.add_evidence(
+                Evidence(
+                    pillar=Pillar.DISC_DB,
+                    kind="title_precedence",
+                    score=0.0,
+                    summary=(
+                        f"Disc title {disc_title!r} differs from TMDB title {guide_title!r} — "
+                        "using the disc's title"
+                    ),
+                    details={"disc_title": disc_title, "tmdb_title": guide_title},
+                )
+            )
+
         # Early exit: every file conclusively matched by pillar 1?
         if self._all_conclusive(probed, guide, options):
             self._progress(PipelineStage.SOLVE, "TheDiscDB already conclusive - skipping deep pillars")
@@ -419,9 +449,17 @@ class Pipeline:
 
         # Stage 8: solve
         self._progress(PipelineStage.SOLVE, "Solving global assignment…")
-        episode_numbers = [episode.episode for episode in guide.episodes]
-        titles = {episode.episode: episode.title for episode in guide.episodes}
         candidates = [candidate for _mkv, candidate in probed]
+        # Review 1.1: episodes covered by a range candidate (E01-E02) cannot be
+        # assigned to another file.
+        episode_numbers = exclude_covered_episodes(
+            [episode.episode for episode in guide.episodes], candidates
+        )
+        titles = {episode.episode: episode.title for episode in guide.episodes}
+        # Review 1.3: disc title precedence for the solver's episode_title.
+        for episode, (_candidate, disc_title) in self._disc_episode_titles.items():
+            if episode in titles:
+                titles[episode] = disc_title
         solved = solve_assignment(
             candidates,
             episode_numbers,
@@ -526,7 +564,7 @@ class Pipeline:
         )
         # With the disc pinned by URL, the MakeMKV title index in the file name
         # (…_t07.mkv) identifies the title near-conclusively.
-        self._apply_disc_matches(probed, report, discs, source=url, index_weight=0.90, season=season)
+        self._apply_disc_matches(probed, report, discs, source=url, index_weight=0.90, season=season, pinned=True)
 
     def _apply_disc_matches(
         self,
@@ -537,6 +575,7 @@ class Pipeline:
         source: str,
         index_weight: float = 0.25,
         season: int,
+        pinned: bool = False,
     ) -> None:
         """Score every file against the loaded disc entries and record evidence."""
         if not discs:
@@ -544,6 +583,14 @@ class Pipeline:
                 self._report(report, mkv.file_name, "disc_db", "skipped", "No disc entries loaded")
             return
         tolerance = self._config.matching.discdb_duration_tolerance_seconds
+        # Review 2.2: score each disc as a unit BEFORE per-title scoring — the
+        # fraction of the disc's episode playlists present in the rip with
+        # matching MPLS name AND duration confirms the pressing.
+        fingerprints = [DiscFingerprint.from_mkv(mkv) for mkv, _candidate in probed]
+        disc_layout_scores = {
+            disc_key(disc): score_disc_layout(disc, fingerprints, duration_tolerance=tolerance)
+            for disc in discs
+        }
         for mkv, candidate in probed:
             fingerprint = DiscFingerprint.from_mkv(mkv)
             matches = match_fingerprint(
@@ -551,6 +598,8 @@ class Pipeline:
                 discs,
                 duration_tolerance=tolerance,
                 index_weight=index_weight,
+                pinned=pinned,
+                disc_layout_scores=disc_layout_scores,
             )
             if not matches or matches[0].episode is None:
                 self._report(report, mkv.file_name, "disc_db", "ok", "No disc fingerprint match")
@@ -583,6 +632,8 @@ class Pipeline:
                     f"Weak fingerprint match ignored ({best.score:.0%} vs {best.disc.disc_name})",
                 )
                 continue
+            # Review 1.1: carry the multi-episode span onto the candidate.
+            candidate.episode_end = best.entry.episode_end
             candidate.add_evidence(
                 Evidence(
                     pillar=Pillar.DISC_DB,
@@ -602,6 +653,12 @@ class Pipeline:
                     season_hint=best.season,
                 )
             )
+            # Review 1.3: remember a non-generic disc title for the
+            # title-precedence decision once the TMDB guide is built.
+            if best.entry.episode_title and not _GENERIC_DISC_TITLE_RE.match(
+                best.entry.episode_title
+            ):
+                self._disc_episode_titles[best.episode] = (candidate, best.entry.episode_title)
             self._report(report, mkv.file_name, "disc_db", "ok", f"{best.score:.0%} via {best.reasons[:2]}")
 
     @staticmethod
@@ -818,13 +875,42 @@ class Pipeline:
     ) -> None:
         best_score = 0.0
         best_episode: int | None = None
+        # Review 4.1: gather the loaded references first — the coverage is
+        # IDF-weighted across them when at least 3 non-empty transcripts exist.
+        refs_by_episode = {
+            episode.episode: reference_for(episode, transcript.language) for episode in guide.episodes
+        }
+        line_weights = build_reference_line_weights(
+            [ref for ref in refs_by_episode.values() if ref is not None]
+        )
+        if line_weights is None:
+            logger.info(
+                "Reference IDF needs >= 3 non-empty references — dialog coverage stays unweighted (N=%d)",
+                sum(1 for ref in refs_by_episode.values() if ref is not None),
+            )
         for episode in guide.episodes:
             score = score_episode(
                 transcript,
                 episode,
-                reference_transcript=reference_for(episode, transcript.language),
+                reference_transcript=refs_by_episode.get(episode.episode),
                 dialog_cutoff=self._config.matching.dialog_match_threshold,
+                line_weights=line_weights,
             )
+            if score.sync_offset_seconds is not None:
+                # Review 4.2: a reference timed to another master is reported,
+                # not silently punished — the score stays, the verdict is tagged.
+                candidate.add_evidence(
+                    Evidence(
+                        pillar=Pillar.SUBTITLE,
+                        kind="sync_check",
+                        score=0.0,
+                        summary=(
+                            f"Reference for {episode.code} is a different master "
+                            f"(offset ~{score.sync_offset_seconds:.0f} s) — dialog coverage may be depressed"
+                        ),
+                        details={"offset_seconds": score.sync_offset_seconds},
+                    )
+                )
             if score.final_score <= 0.0:
                 continue
             candidate.add_evidence(

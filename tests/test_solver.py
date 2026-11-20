@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import itertools
 import random
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -224,3 +225,31 @@ class TestUniqueDurationCalibration:
         solved = solve_assignment([c], [6], season=1, min_confidence=0.55)
         assert len(solved.entries) == 1
         assert solved.entries[0].confidence == pytest.approx(0.70)
+
+class TestExcludeCoveredEpisodes:
+    """Review 1.1: a range assignment (E01-E02) consumes BOTH episodes — the
+    covered follow-up episode must not be assignable to another file."""
+
+    def test_range_candidate_covers_follow_up(self) -> None:
+        from episodematch.matcher.solver import exclude_covered_episodes
+
+        candidate = MatchCandidate(
+            file_path=Path("D:/rips/title_t00.mkv"),
+            episode_end=2,
+            evidence=[
+                Evidence(
+                    pillar=Pillar.DISC_DB,
+                    kind="fingerprint_match",
+                    score=0.9,
+                    summary="Disc fingerprint matches E01-E02",
+                    episode_hint=1,
+                )
+            ],
+        )
+        assert exclude_covered_episodes([1, 2, 3, 4], [candidate]) == [1, 3, 4]
+
+    def test_candidates_without_range_leave_numbers_untouched(self) -> None:
+        from episodematch.matcher.solver import exclude_covered_episodes
+
+        candidates = [MatchCandidate(file_path=Path("D:/rips/title_t00.mkv"))]
+        assert exclude_covered_episodes([1, 2, 3], candidates) == [1, 2, 3]

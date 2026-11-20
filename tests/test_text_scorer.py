@@ -278,3 +278,147 @@ class TestCreditEvidenceDisplayOnly:
         items = credit_evidence(hits, score)
         assert items
         assert all(item.episode_hint is None for item in items)
+
+class TestReferenceLineWeights:
+    """Review 4.1: show-generic lines (present in EVERY candidate reference)
+    carry zero discriminating information — the coverage must be weighted by
+    line-level IDF across the loaded references, with a floor of 3 non-empty
+    references before IDF means anything."""
+
+    @staticmethod
+    def _ref(lines: list[str], language: str = "ger") -> Transcript:
+        from episodematch.core.models import SubtitleLine
+
+        return Transcript(
+            source="test",
+            language=language,
+            track_index=1,
+            lines=[
+                SubtitleLine(start_seconds=float(i) * 2, end_seconds=float(i) * 2 + 1.5, text=line)
+                for i, line in enumerate(lines)
+            ],
+        )
+
+    def test_fewer_than_three_non_empty_references_returns_none(self) -> None:
+        from episodematch.matcher.text_scorer import build_reference_line_weights
+
+        refs = [self._ref(["one unique line"]), self._ref(["another unique line"]), self._ref([])]
+        assert build_reference_line_weights(refs) is None  # only 2 non-empty
+
+    def test_generic_lines_get_zero_weight_unique_get_idf(self) -> None:
+        from episodematch.matcher.text_scorer import build_reference_line_weights
+
+        generic = "the springfield police department arrived"
+        refs = [
+            self._ref([generic, "unique line one alpha"]),
+            self._ref([generic, "unique line two beta"]),
+            self._ref([generic, "unique line three gamma"]),
+        ]
+        weights = build_reference_line_weights(refs)
+        assert weights is not None
+        assert weights["the springfield police department arrived"] == 0.0  # present in all 3
+        assert weights["unique line one alpha"] > 0.0  # discriminative
+
+    def test_score_episode_idf_weights_coverage(self) -> None:
+        """The trap from the review: a small reference whose few confirmed lines
+        are ALL generic must not outrank the true episode."""
+        import math
+
+        from episodematch.matcher.text_scorer import build_reference_line_weights, score_episode
+
+        generic = "the springfield police department arrived"
+        e01_lines = [
+            "the lighthouse keeper whispers to the tide",
+            "a lantern burns alone on the northern pier",
+        ]
+        e02_lines = [
+            "the counterfeit passports were hidden under the floorboards",
+            "elizabeth burned the microfilm before the courier arrived",
+            "the kgb handler watched the embassy from the parked sedan",
+        ] + [f"martha packed the radio transmitter crate number {i} for the embassy run" for i in range(72)]
+        e03_lines = [
+            "the harvest festival opens with the mayor speech",
+            "grain prices collapse after the storm hits the county",
+        ]
+        refs = [
+            self._ref([generic] + e01_lines),
+            self._ref([generic] + e02_lines),
+            self._ref([generic] + e03_lines),
+        ]
+        weights = build_reference_line_weights(refs)
+        episode_e01 = EpisodeInfo(season=1, episode=1, title="E1", plot="e1 plot filler")
+        episode_e02 = EpisodeInfo(season=1, episode=2, title="E2", plot="e2 plot filler")
+
+        # The rip contains ALL generic lines plus the true E02 dialog.
+        extracted = self._ref([generic] + e02_lines)
+
+        score_e01 = score_episode(extracted, episode_e01, reference_transcript=refs[0], line_weights=weights)
+        score_e02 = score_episode(extracted, episode_e02, reference_transcript=refs[1], line_weights=weights)
+        # Unweighted, E01's 6/8 coverage would outrank E02's 80/82 — with IDF the
+        # generic lines vanish and the true episode wins clearly.
+        assert score_e02.final_score > score_e01.final_score
+
+    def test_weighted_coverage_ignores_generic_only_confirmation(self) -> None:
+        from episodematch.matcher.text_scorer import align_dialogs
+
+        alignment = align_dialogs(
+            [generic := "the springfield police department arrived"],
+            [generic, "truly unique episode line"],
+            line_weights={generic: 0.0, "truly unique episode line": 1.0},
+        )
+        assert alignment.coverage == 0.0  # only zero-weight lines confirmed
+        assert alignment.score == 0.0
+
+    def test_without_weights_coverage_stays_unweighted(self) -> None:
+        from episodematch.matcher.text_scorer import align_dialogs
+
+        alignment = align_dialogs(
+            ["the springfield police department arrived"],
+            ["the springfield police department arrived", "truly unique episode line"],
+        )
+        assert alignment.coverage == 0.5  # legacy behaviour preserved
+
+
+class TestReferenceSyncCheck:
+    """Review 4.2: a reference subtitle is timed to a retail release — when its
+    cues sit more than 20 s away from the file's own track (first AND last
+    cue), the candidate is tagged "different master" instead of silently
+    depressing the score."""
+
+    @staticmethod
+    def _ref(lines: list[tuple[float, float]], language: str = "ger") -> Transcript:
+        from episodematch.core.models import SubtitleLine
+
+        return Transcript(
+            source="test",
+            language=language,
+            track_index=1,
+            lines=[
+                SubtitleLine(start_seconds=start, end_seconds=end, text=f"dialog {start}")
+                for start, end in lines
+            ],
+        )
+
+    def test_large_offset_is_reported(self) -> None:
+        from episodematch.matcher.text_scorer import check_reference_sync
+
+        own = self._ref([(10.0, 12.0), (100.0, 103.0)])
+        ref = self._ref([(70.0, 72.0), (160.0, 163.0)])
+        offset = check_reference_sync(own, ref)
+        assert offset is not None and offset > 20.0
+
+    def test_small_offset_returns_none(self) -> None:
+        from episodematch.matcher.text_scorer import check_reference_sync
+
+        own = self._ref([(10.0, 12.0), (100.0, 103.0)])
+        ref = self._ref([(15.0, 17.0), (105.0, 108.0)])
+        assert check_reference_sync(own, ref) is None
+
+    def test_score_episode_carries_sync_offset(self) -> None:
+        from episodematch.matcher.text_scorer import score_episode
+
+        episode = EpisodeInfo(season=1, episode=1, title="E1", plot="e1 plot filler")
+        own = self._ref([(10.0, 12.0), (100.0, 103.0)])
+        ref = self._ref([(70.0, 72.0), (160.0, 163.0)])
+        score = score_episode(own, episode, reference_transcript=ref)
+        assert score.sync_offset_seconds is not None and score.sync_offset_seconds > 20.0

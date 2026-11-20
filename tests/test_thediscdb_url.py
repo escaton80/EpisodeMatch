@@ -171,7 +171,7 @@ class TestMakeMkvIndexMatch:
         discs = self._south_park_disc()
         # t02 -> disc index 2 = S06E01 "Jared Has Aides" (no MPLS, size useless).
         fingerprint = self._rip("South Park Season 6 - Disc 1_t02.mkv", size=3358907795)
-        matches = match_fingerprint(fingerprint, discs, index_weight=0.90)
+        matches = match_fingerprint(fingerprint, discs, index_weight=0.90, pinned=True)
         assert matches[0].episode == 1
         assert matches[0].entry.episode_title == "Jared Has Aides"
         assert matches[0].score >= 0.95
@@ -184,7 +184,7 @@ class TestMakeMkvIndexMatch:
 
         discs = self._south_park_disc()
         fingerprint = self._rip("South Park Season 6 - Disc 1_t00.mkv", size=3434955687)
-        matches = match_fingerprint(fingerprint, discs, index_weight=0.90)
+        matches = match_fingerprint(fingerprint, discs, index_weight=0.90, pinned=True)
         assert matches[0].episode == 5
         assert matches[0].entry.episode_title == "The New Terrance and Phillip Movie Trailer"
 
@@ -254,12 +254,12 @@ class TestCastleRockIndexCollision:
 
         discs = self._castle_rock_disc()
         fingerprint = self._rip("Castle Rock Season 1 Disc 2_t06.mkv", size=7350674994, duration=2616.0)
-        matches = match_fingerprint(fingerprint, discs, index_weight=0.90)
+        matches = match_fingerprint(fingerprint, discs, index_weight=0.90, pinned=True)
         assert matches[0].episode == 6  # by its UNIQUE duration, not the index
         assert matches[0].score >= 0.75
         reasons = " ".join(matches[0].reasons)
         assert "corroborated" not in reasons
-        assert "unique on disc" in reasons
+        assert "unique on its own disc" in reasons
 
     def test_unique_duration_carries_the_match(self) -> None:
         from episodematch.providers.thediscdb import match_fingerprint
@@ -273,7 +273,7 @@ class TestCastleRockIndexCollision:
             ("Castle Rock Season 1 Disc 2_t10.mkv", 8978856627, 3107.616, 10),
         ):
             fingerprint = self._rip(name, size=size, duration=duration)
-            matches = match_fingerprint(fingerprint, discs, index_weight=0.90)
+            matches = match_fingerprint(fingerprint, discs, index_weight=0.90, pinned=True)
             assert matches[0].episode == expected_episode, name
             assert matches[0].score >= 0.65
 
@@ -284,7 +284,7 @@ class TestCastleRockIndexCollision:
         discs = self._castle_rock_disc()
         # A rip whose MakeMKV index (6) AND duration match E8's entry (idx 6).
         fingerprint = self._rip("Castle Rock Season 1 Disc 2_t06.mkv", size=8408008704, duration=3036.0)
-        matches = match_fingerprint(fingerprint, discs, index_weight=0.90)
+        matches = match_fingerprint(fingerprint, discs, index_weight=0.90, pinned=True)
         assert matches[0].episode == 8
         assert matches[0].score >= 0.95
         assert any("corroborated" in reason for reason in matches[0].reasons)
@@ -426,3 +426,212 @@ class TestMplsVsIndexPinned:
         assert "MPLS 00001.mpls matches disc entry" in " ".join(matches[0].reasons)
         # the contradicting index match was ignored entirely
         assert all("title index" not in r for m in matches for r in m.reasons)
+
+class TestDiscTitleFieldParsing:
+    """Review 1.1/1.2: hand-entered Item fields come in two shapes the parser
+    must survive — episode ranges ("1-2" = one playlist covering two episodes)
+    and suggested filenames pasted into Title."""
+
+    def _payload(self, item: dict) -> dict:
+        return {
+            "Titles": [
+                {
+                    "Index": 0,
+                    "SourceFile": "00800.mpls",
+                    "SegmentMap": "1-11,12",
+                    "Duration": "0:43:00",
+                    "Size": 2_000_000_000,
+                    "Item": item,
+                }
+            ]
+        }
+
+    def _parse(self, item: dict):
+        from episodematch.providers.thediscdb import parse_disc_json
+
+        return parse_disc_json(
+            self._payload(item), series_title="Show (2020)", release_title="season-1", source="test"
+        ).titles[0]
+
+    def test_episode_range_is_parsed_as_span(self) -> None:
+        entry = self._parse({"Title": "London", "Type": "Episode", "Season": "6", "Episode": "1-2"})
+        assert entry.episode == 1
+        assert entry.episode_end == 2
+        assert entry.is_episode  # the two-parter must be a candidate
+        assert entry.episode_title == "London"
+
+    def test_filename_like_title_is_normalized(self) -> None:
+        entry = self._parse(
+            {"Title": "Parks and Recreation.S06.E09.The Cones of Dunshire.mkv", "Type": "Episode", "Season": "6", "Episode": "9"}
+        )
+        assert entry.episode_title == "The Cones of Dunshire"
+
+    def test_dotted_title_without_media_extension_is_untouched(self) -> None:
+        """The rewrite is gated on an actual file extension — a genuine title
+        containing dots must not be mangled."""
+        entry = self._parse(
+            {"Title": "Parks and Recreation.S06.E09.The Cones of Dunshire", "Type": "Episode", "Season": "6", "Episode": "9"}
+        )
+        assert entry.episode_title == "Parks and Recreation.S06.E09.The Cones of Dunshire"
+
+    def test_plain_title_untouched(self) -> None:
+        entry = self._parse({"Title": "The Cones of Dunshire", "Type": "Episode", "Season": "6", "Episode": "9"})
+        assert entry.episode_title == "The Cones of Dunshire"
+
+class TestDiscLayoutScore:
+    """Review 2.2: a disc is confirmed as a unit — the fraction of its episode
+    playlists present in the rip with a matching MPLS name AND a matching
+    running time (both together; either alone is ambiguous)."""
+
+    @staticmethod
+    def _disc() -> list:
+        from episodematch.providers.thediscdb import parse_disc_json
+
+        payload = {
+            "Name": "Season 1 Disc 1",
+            "Slug": "season-1",
+            "Format": "Blu-Ray",
+            "Titles": [
+                {"Index": 0, "SourceFile": "00800.mpls", "SegmentMap": "1-11,12", "Duration": "0:42:30", "Size": 2_028_000_000, "Item": {"Title": "Pilot", "Type": "Episode", "Season": "1", "Episode": "1"}},
+                {"Index": 1, "SourceFile": "00801.mpls", "SegmentMap": "1-11,12", "Duration": "0:41:55", "Size": 2_011_000_000, "Item": {"Title": "Second", "Type": "Episode", "Season": "1", "Episode": "2"}},
+                {"Index": 2, "SourceFile": "00055.mpls", "SegmentMap": "1012", "Duration": "0:00:10", "Size": 270336, "Item": {"Type": "Extra"}},
+            ],
+        }
+        return [parse_disc_json(payload, series_title="Show (2020)", release_title="season-1", source="test")]
+
+    @staticmethod
+    def _fps(*specs: tuple[str, float]) -> list:
+        from episodematch.core.models import DiscFingerprint, MkvFile
+
+        out = []
+        for index, (mpls, duration) in enumerate(specs):
+            mkv = MkvFile(
+                path=f"D:/rips/title_t{index:02d}.mkv",
+                size_bytes=2_000_000_000,
+                duration_seconds=duration,
+                title_tag=mpls,
+                source_id=mpls,
+            )
+            out.append(DiscFingerprint.from_mkv(mkv))
+        return out
+
+    def test_full_layout_scores_1(self) -> None:
+        from episodematch.providers.thediscdb import score_disc_layout
+
+        assert score_disc_layout(self._disc()[0], self._fps(("00800.mpls", 2550.0), ("00801.mpls", 2515.0))) == 1.0
+
+    def test_partial_layout_scores_half(self) -> None:
+        from episodematch.providers.thediscdb import score_disc_layout
+
+        assert score_disc_layout(self._disc()[0], self._fps(("00800.mpls", 2550.0))) == 0.5
+
+    def test_duration_without_matching_mpls_counts_nothing(self) -> None:
+        from episodematch.providers.thediscdb import score_disc_layout
+
+        assert score_disc_layout(self._disc()[0], self._fps(("00999.mpls", 2550.0))) == 0.0
+
+    def test_empty_rip_scores_zero(self) -> None:
+        from episodematch.providers.thediscdb import score_disc_layout
+
+        assert score_disc_layout(self._disc()[0], []) == 0.0
+
+
+class TestDurationUniquenessLadder:
+    """Review 2.1: duration uniqueness is counted PER DISC, and the full
+    +0.70 unique bonus only applies to a PINNED disc or one confirmed by the
+    layout gate — several unpinned discs must not each hand out +0.70."""
+
+    @staticmethod
+    def _two_discs() -> list:
+        from episodematch.providers.thediscdb import parse_disc_json
+
+        titles = lambda disc_index: [
+            {"Index": 0, "SourceFile": f"0080{disc_index}.mpls", "SegmentMap": "1-11,12", "Duration": "0:42:30", "Size": 2_028_000_000, "Item": {"Title": "Same Length", "Type": "Episode", "Season": "1", "Episode": str(disc_index * 2 + 1)}},
+            {"Index": 1, "SourceFile": f"0081{disc_index}.mpls", "SegmentMap": "1-11,12", "Duration": "0:41:55", "Size": 2_011_000_000, "Item": {"Title": "Other", "Type": "Episode", "Season": "1", "Episode": str(disc_index * 2 + 2)}},
+        ]
+        return [
+            parse_disc_json({"Name": f"Disc {i}", "Slug": f"s-{i}", "Format": "Blu-Ray", "Titles": titles(i)},
+                            series_title="Show (2020)", release_title="season-1", source="test")
+            for i in (0, 1)
+        ]
+
+    @staticmethod
+    def _fp(mpls: str, duration: float):
+        from episodematch.core.models import DiscFingerprint, MkvFile
+
+        mkv = MkvFile(path="D:/rips/title_t00.mkv", size_bytes=2_028_000_000, duration_seconds=duration,
+                      title_tag=mpls, source_id=mpls)
+        return DiscFingerprint.from_mkv(mkv)
+
+    def test_unpinned_multi_disc_unique_is_damped(self) -> None:
+        from episodematch.providers.thediscdb import match_fingerprint
+
+        discs = self._two_discs()
+        fp = self._fp("00800.mpls", 2550.0)  # unique on EACH disc's own set
+        matches = match_fingerprint(fp, discs)
+        top = matches[0]
+        reasons = " ".join(top.reasons)
+        assert "unique on its own disc" in reasons
+        assert "bonus damped" in reasons  # NOT the full +0.70
+
+    def test_pinned_disc_gets_full_unique_bonus(self) -> None:
+        from episodematch.providers.thediscdb import match_fingerprint
+
+        discs = self._two_discs()
+        fp = self._fp("00800.mpls", 2550.0)
+        matches = match_fingerprint(fp, discs, pinned=True)
+        reasons = " ".join(matches[0].reasons)
+        assert "unique on its own disc" in reasons
+        assert "bonus damped" not in reasons
+
+    def test_layout_confirmed_disc_gets_full_unique_bonus(self) -> None:
+        from episodematch.providers.thediscdb import disc_key, match_fingerprint, score_disc_layout
+
+        discs = self._two_discs()
+        from episodematch.core.models import DiscFingerprint, MkvFile
+
+        def make_fp(mpls: str, duration: float) -> DiscFingerprint:
+            mkv = MkvFile(path="D:/rips/x.mkv", size_bytes=2_000_000_000, duration_seconds=duration,
+                          title_tag=mpls, source_id=mpls)
+            return DiscFingerprint.from_mkv(mkv)
+
+        fps = [make_fp("00800.mpls", 2550.0), make_fp("00810.mpls", 2515.0)]
+        layout_scores = {disc_key(d): score_disc_layout(d, fps) for d in discs}
+        confirmed = {discs[0]}  # only disc 0's playlists are present in the rip
+        layout_for_fp = {disc_key(d): s for d, s in zip(discs, layout_scores.values()) if d in confirmed}
+        fp = self._fp("00800.mpls", 2550.0)
+        matches = match_fingerprint(fp, discs, disc_layout_scores=layout_for_fp)
+        reasons = " ".join(matches[0].reasons)
+        assert "unique on its own disc" in reasons
+        assert "bonus damped" not in reasons
+        assert "layout confirmed" in reasons
+
+
+class TestTypeOverridesDuration:
+    """Review 2.3: a title's runtime can never override Item.Type — an
+    episode-length Extra/Menü entry is never a candidate."""
+
+    def test_episode_length_extra_is_never_a_candidate(self) -> None:
+        from episodematch.providers.thediscdb import parse_disc_json
+
+        payload = {
+            "Name": "D", "Slug": "d", "Format": "DVD",
+            "Titles": [
+                {"Index": 0, "SourceFile": "00001.mpls", "Duration": "0:26:49", "Size": 1_500_000_000, "Item": {"Title": "Producer's Extended Cut", "Type": "Extra"}},
+                {"Index": 1, "SourceFile": "00002.mpls", "Duration": "0:21:30", "Size": 1_000_000_000, "Item": {"Title": "Real Episode", "Type": "Episode", "Season": "1", "Episode": "5"}},
+            ],
+        }
+        discs = [parse_disc_json(payload, series_title="X", release_title="r", source="t")]
+        from episodematch.core.models import DiscFingerprint, MkvFile
+
+        mkv = MkvFile(path="D:/x/title_t00.mkv", size_bytes=1_500_000_000, duration_seconds=1609.0)  # the Extra's runtime
+        fp = DiscFingerprint.from_mkv(mkv)
+        from episodematch.providers.thediscdb import match_fingerprint
+
+        matches = match_fingerprint(fp, discs)
+        # The Extra matches on its runtime — but it is NEVER an episode
+        # candidate: the pipeline treats matches[0].episode is None as "no
+        # match" (a title's runtime can never override Item.Type).
+        assert matches, "the Extra itself still matches by duration"
+        assert matches[0].episode is None
+        assert all(m.episode != 5 for m in matches if m.episode is not None)

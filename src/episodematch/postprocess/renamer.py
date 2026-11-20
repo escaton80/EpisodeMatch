@@ -14,8 +14,10 @@ Features:
 from __future__ import annotations
 
 import datetime as _dt
+import errno
 import json
 import logging
+import shutil
 from uuid import uuid4
 from dataclasses import dataclass
 from pathlib import Path
@@ -86,6 +88,7 @@ def build_rename_plan(
             series=series,
             season=entry.season,
             episode=entry.episode,
+            episode_end=entry.episode_end,
             title=title,
             extension="",
         )
@@ -184,6 +187,13 @@ class Renamer:
         failure (disk error, vanished source) leaves an undo journal for the
         renames that already happened — and OSError is wrapped into
         :class:`RenameError` so the CLI reports it properly.
+
+        Review 7.1: same-filesystem renames keep the fast two-step path
+        (`source -> temp -> destination`). A cross-filesystem source (NAS share,
+        second drive) fails with EXDEV — in that case the file is *staged as a
+        verified copy* inside the destination directory (copy2 -> size check ->
+        atomic rename), and the original is deleted only afterwards, so the
+        library is never left without the file.
         """
         self.validate(plan)
         if plan.dry_run:
@@ -201,8 +211,9 @@ class Renamer:
                 if temp.exists():
                     raise RenameError(f"Temporary rename target already exists: {temp}")
                 try:
-                    item.source.rename(temp)
-                    temp.rename(item.destination)
+                    self._stage_and_rename(item.source, temp, item.destination)
+                except RenameError:
+                    raise
                 except OSError as exc:
                     raise RenameError(f"Rename failed for {item.source.name}: {exc}") from exc
                 applied.append(item)
@@ -215,6 +226,42 @@ class Renamer:
             if not operations:
                 journal_path.unlink(missing_ok=True)  # nothing applied -> drop empty journal
         return applied
+
+    @staticmethod
+    def _stage_and_rename(source: Path, temp: Path, destination: Path) -> None:
+        """Move `source` into place via `temp`, crossing filesystems when needed.
+
+        Same filesystem: fast two-step rename. Cross filesystem (EXDEV): stage a
+        verified `copy2` inside the destination directory, then atomically rename
+        it into place — the original is deleted only after the copy is verified,
+        so a failure can never leave the library with *no* file.
+        """
+        try:
+            source.rename(temp)
+        except OSError as exc:
+            if exc.errno != errno.EXDEV:
+                raise
+            logger.info("Cross-filesystem rename detected (%s) — staging a verified copy", source)
+            try:
+                shutil.copy2(source, temp)
+            except OSError as copy_exc:
+                temp.unlink(missing_ok=True)
+                raise RenameError(f"Cross-filesystem staging failed for {source.name}: {copy_exc}") from copy_exc
+            if temp.stat().st_size != source.stat().st_size:
+                temp.unlink(missing_ok=True)
+                raise RenameError(
+                    f"Cross-filesystem staging size mismatch for {source.name} "
+                    f"({source.stat().st_size} -> {temp.stat().st_size} bytes)"
+                )
+            temp.rename(destination)
+            try:
+                source.unlink()
+            except OSError as unlink_exc:
+                # The rename already succeeded and is journaled — a failed delete
+                # leaves a duplicate, never a gap.
+                logger.warning("Renamed %s but could not delete the original: %s", source, unlink_exc)
+            return
+        temp.rename(destination)
 
     def _new_journal_path(self) -> Path:
         timestamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")

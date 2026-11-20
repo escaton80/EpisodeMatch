@@ -624,3 +624,194 @@ class TestProgressPerFile:
         percents = [e.percent for e in percent_events]
         assert percents == sorted(percents) and percents[-1] == 100.0
         assert all(e.file_name for e in percent_events)
+
+class TestDiscTitlePrecedence:
+    """Review 1.3: the disc's own episode title wins over the TMDB title
+    (broadcast vs production naming), but generic placeholder titles
+    ("Episode 1") fall back to TMDB. Disagreements become visible evidence."""
+
+    def _disc_repo(self, tmp_path: Path, e01_title: str) -> Path:
+        import json as _json
+
+        root = tmp_path / "discdb"
+        release_dir = root / "data" / "series" / "Test Show (2020)" / "season-1"
+        release_dir.mkdir(parents=True)
+        payload = {
+            "Index": 1,
+            "Slug": "blu-ray",
+            "Name": "Test Show Season 1 Disc 1",
+            "Format": "Blu-Ray",
+            "Titles": [
+                {
+                    "Index": 0,
+                    "SourceFile": "00800.mpls",
+                    "SegmentMap": "1-11,12",
+                    "Duration": "0:42:30",
+                    "Size": 2_028_000_000,
+                    "Item": {"Title": e01_title, "Type": "Episode", "Season": "1", "Episode": "1"},
+                },
+            ],
+        }
+        (release_dir / "disc01.json").write_text(_json.dumps(payload), encoding="utf-8")
+        return root
+
+    def _scan(self, config: AppConfig, repo: Path, rip_folder: Path) -> ScanReport:
+        mkv = make_mkv("title_t00.mkv", mpls="00800.mpls", duration=42 * 60 + 30, size=2_028_000_000)
+        events: list[ProgressEvent] = []
+        pipeline = build_pipeline(
+            config,
+            ffprobe=FakeFfprobe({"title_t00.mkv": mkv}),
+            disc_db_client=LocalDiscDbImporter(repo),
+            tmdb=FakeTmdb(make_guide()),
+            progress=events.append,
+        )
+        return pipeline.scan_folder(
+            rip_folder, series="Test Show", season=1, options=ScanOptions(depth="fast")
+        )
+
+    def test_real_disc_title_wins_and_records_disagreement(
+        self, config: AppConfig, rip_folder: Path, tmp_path: Path
+    ) -> None:
+        report = self._scan(config, self._disc_repo(tmp_path, "The Premiere"), rip_folder)
+        entry = report.assignment.entries[0]
+        assert entry.episode_title == "The Premiere"  # disc title beats TMDB "Pilot"
+        evidence = [e for e in entry.evidence if e.kind == "title_precedence"]
+        assert evidence, "the disagreement must be visible as evidence"
+        assert "The Premiere" in evidence[0].summary and "Pilot" in evidence[0].summary
+
+    def test_generic_disc_title_falls_back_to_tmdb(
+        self, config: AppConfig, rip_folder: Path, tmp_path: Path
+    ) -> None:
+        report = self._scan(config, self._disc_repo(tmp_path, "Episode 1"), rip_folder)
+        entry = report.assignment.entries[0]
+        assert entry.episode_title == "Pilot"  # TMDB wins over a placeholder
+
+
+class TestEpisodeRangeAssignment:
+    """Review 1.1: a two-part story published as `Episode: "1-2"` is one file
+    covering two episodes — it must be a candidate, assigned to its start
+    episode, carry the span, and consume the covered follow-up episode."""
+
+    def _disc_repo(self, tmp_path: Path) -> Path:
+        import json as _json
+
+        root = tmp_path / "discdb"
+        release_dir = root / "data" / "series" / "Test Show (2020)" / "season-1"
+        release_dir.mkdir(parents=True)
+        payload = {
+            "Index": 1,
+            "Slug": "blu-ray",
+            "Name": "Test Show Season 1 Disc 1",
+            "Format": "Blu-Ray",
+            "Titles": [
+                {
+                    "Index": 0,
+                    "SourceFile": "00800.mpls",
+                    "SegmentMap": "1-11,12",
+                    "Duration": "0:43:00",
+                    "Size": 2_028_000_000,
+                    "Item": {"Title": "London", "Type": "Episode", "Season": "1", "Episode": "1-2"},
+                },
+            ],
+        }
+        (release_dir / "disc01.json").write_text(_json.dumps(payload), encoding="utf-8")
+        return root
+
+    def test_range_entry_assigned_with_span(
+        self, config: AppConfig, rip_folder: Path, tmp_path: Path
+    ) -> None:
+        mkv = make_mkv("title_t00.mkv", mpls="00800.mpls", duration=43 * 60, size=2_100_000_000)
+        pipeline = build_pipeline(
+            config,
+            ffprobe=FakeFfprobe({"title_t00.mkv": mkv}),
+            disc_db_client=LocalDiscDbImporter(self._disc_repo(tmp_path)),
+            tmdb=FakeTmdb(make_guide()),
+        )
+        report = pipeline.scan_folder(
+            rip_folder, series="Test Show", season=1, options=ScanOptions(depth="fast")
+        )
+        entry = report.assignment.entries[0]
+        assert entry.episode == 1
+        assert entry.episode_end == 2  # the span reaches the assignment
+        assert entry.episode_title == "London"
+
+class TestReferenceIdfAndSync:
+    """Review 4.1/4.2 wiring in the pipeline: the coverage is IDF-weighted
+    across the loaded references (>= 3 non-empty), and a reference timed to a
+    different master (> 20 s) is tagged as evidence instead of silently
+    depressing the score."""
+
+    @staticmethod
+    def _sub(lines: list[tuple[float, float, str]], language: str = "ger") -> Transcript:
+        from episodematch.core.models import SubtitleLine
+
+        return Transcript(
+            source="test",
+            language=language,
+            track_index=1,
+            lines=[
+                SubtitleLine(start_seconds=start, end_seconds=end, text=line)
+                for start, end, line in lines
+            ],
+        )
+
+    @staticmethod
+    def _three_episode_guide() -> SeasonGuide:
+        from episodematch.core.models import EpisodeInfo, SeriesInfo
+
+        series = SeriesInfo(name="Test Show", tmdb_id=42, imdb_id="tt1234567", first_air_year=2020)
+        episodes = [
+            EpisodeInfo(season=1, episode=1, title="Pilot", plot="e1 plot filler"),
+            EpisodeInfo(season=1, episode=2, title="Second", plot="e2 plot filler"),
+            EpisodeInfo(season=1, episode=3, title="Third", plot="e3 plot filler"),
+        ]
+        return SeasonGuide(series=series, season=1, episodes=episodes)
+
+    GENERIC = "the springfield police department arrived"
+
+    def test_idf_keeps_generic_small_reference_from_winning(self, config: AppConfig) -> None:
+        from episodematch.core.models import MatchCandidate
+
+        pipeline = build_pipeline(config)
+        candidate = MatchCandidate(file_path=Path("D:/rips/title_t00.mkv"))
+        guide = self._three_episode_guide()
+
+        e01_ref = self._sub(
+            [(float(i), float(i) + 1.5, line) for i, line in enumerate(
+                [self.GENERIC, "the lighthouse keeper whispers to the tide",
+                 "a lantern burns alone on the northern pier"])]
+        )
+        e02_lines = [self.GENERIC] + [
+            "the counterfeit passports were hidden under the floorboards",
+            "elizabeth burned the microfilm before the courier arrived",
+        ] + [f"martha packed the radio transmitter crate {i} for the run" for i in range(20)]
+        e02_ref = self._sub([(float(i), float(i) + 1.5, line) for i, line in enumerate(e02_lines)])
+        e03_ref = self._sub(
+            [(float(i), float(i) + 1.5, line) for i, line in enumerate(
+                [self.GENERIC, "grain prices collapse after the storm"])]
+        )
+        refs = {1: e01_ref, 2: e02_ref, 3: e03_ref}
+        # The rip contains every generic line plus the true E02 dialog.
+        transcript = self._sub([(float(i), float(i) + 1.5, line) for i, line in enumerate(e02_lines)])
+
+        pipeline._score_transcript(candidate, transcript, guide, lambda episode, lang: refs.get(episode.episode))
+        text_evidence = [e for e in candidate.evidence if e.kind == "text_match" and e.episode_hint]
+        best = max(text_evidence, key=lambda e: e.score)
+        # Unweighted, E01's 3/4 coverage would outrank E02's 23/24 — with IDF the
+        # generic lines drop out and the true episode wins.
+        assert best.episode_hint == 2
+
+    def test_shifted_reference_tagged_as_different_master(self, config: AppConfig) -> None:
+        from episodematch.core.models import MatchCandidate
+
+        pipeline = build_pipeline(config)
+        candidate = MatchCandidate(file_path=Path("D:/rips/title_t00.mkv"))
+        guide = self._three_episode_guide()
+
+        own = self._sub([(10.0, 12.0, "own dialog line one"), (100.0, 103.0, "own dialog line two")])
+        shifted = self._sub([(70.0, 72.0, "own dialog line one"), (160.0, 163.0, "own dialog line two")])
+        refs = {1: shifted, 2: None, 3: None}
+        pipeline._score_transcript(candidate, own, guide, lambda episode, lang: refs.get(episode.episode))
+        sync_evidence = [e for e in candidate.evidence if e.kind == "sync_check"]
+        assert sync_evidence, "a >20 s reference offset must be reported as evidence"
+        assert "different master" in sync_evidence[0].summary

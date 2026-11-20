@@ -355,3 +355,120 @@ class TestRepointEntries:
         repointed = repoint_entries(entries, applied)
         assert entries[0].file_path == tmp_path / "same.mkv"
         assert repointed == 0
+
+class TestMultiEpisodeNaming:
+    """Review 1.1: an entry with episode_end renders Jellyfin's multi-episode
+    form with the default template — automatically, without a custom template."""
+
+    def test_range_entry_renders_e01_e02(self, tmp_path: Path) -> None:
+        entry = AssignmentEntry(
+            file_path=tmp_path / "rips" / "title_t00.mkv",
+            season=1,
+            episode=1,
+            episode_end=2,
+            episode_title="London",
+            confidence=0.9,
+        )
+        plan = build_rename_plan(
+            [entry],
+            series="Show",
+            template="{series}/Season {season:02d}/{series} - S{season:02d}E{episode:02d} - {title}",
+        )
+        assert plan.items[0].destination.name == "Show - S01E01-E02 - London.mkv"
+
+    def test_single_episode_entry_unaffected(self, tmp_path: Path) -> None:
+        entry = AssignmentEntry(
+            file_path=tmp_path / "rips" / "title_t00.mkv",
+            season=1,
+            episode=1,
+            episode_title="Pilot",
+            confidence=0.9,
+        )
+        plan = build_rename_plan(
+            [entry],
+            series="Show",
+            template="{series}/Season {season:02d}/{series} - S{season:02d}E{episode:02d} - {title}",
+        )
+        assert plan.items[0].destination.name == "Show - S01E01 - Pilot.mkv"
+
+class TestCrossFilesystemRename:
+    """Review 7.1: renaming across filesystems (NAS share, second drive) fails
+    with EXDEV — the renamer stages a verified copy in the destination
+    directory instead of failing the batch. Same-filesystem renames keep the
+    fast two-step path."""
+
+    def _plan(self, tmp_path: Path) -> tuple[Path, Path]:
+        rips = tmp_path / "rips"
+        rips.mkdir()
+        source = rips / "title_t00.mkv"
+        source.write_bytes(b"x" * 10_000)
+        entry = AssignmentEntry(
+            file_path=source,
+            season=1,
+            episode=1,
+            episode_title="Pilot",
+            confidence=0.9,
+        )
+        plan = build_rename_plan(
+            [entry],
+            series="Show",
+            template="{series} - S{season:02d}E{episode:02d} - {title}",
+            season_folder=False,
+        )
+        destination = plan.items[0].destination
+        return source, destination
+
+    def test_exdev_fallback_stages_verified_copy(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        import errno
+        from pathlib import Path as _Path
+
+        source, destination = self._plan(tmp_path)
+        renamer = Renamer(tmp_path / "undo")
+        real_rename = _Path.rename
+
+        def fake_rename(self: _Path, target: _Path):
+            # Only the FIRST leg (source -> temp in the destination directory)
+            # is simulated cross-filesystem; the second leg stays real.
+            if self == source and str(target).startswith(str(destination.parent)):
+                raise OSError(errno.EXDEV, "Invalid cross-device link")
+            return real_rename(self, target)
+
+        monkeypatch.setattr(_Path, "rename", fake_rename)
+        applied = renamer.apply(self.plan_of(source, destination))
+        assert applied and applied[0].destination.exists()
+        assert applied[0].destination.stat().st_size == 10_000  # verified copy
+        assert not source.exists()  # the original is deleted last
+        journals = renamer.list_journals()
+        assert journals and len(json.loads(journals[0].read_text(encoding="utf-8"))["operations"]) == 1
+
+    def test_size_mismatch_aborts_and_cleans_temp(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        import errno
+        import shutil as _shutil
+        from pathlib import Path as _Path
+
+        source, destination = self._plan(tmp_path)
+        renamer = Renamer(tmp_path / "undo")
+        real_rename = _Path.rename
+
+        def fake_rename(self: _Path, target: _Path):
+            if self == source and str(target).startswith(str(destination.parent)):
+                raise OSError(errno.EXDEV, "Invalid cross-device link")
+            return real_rename(self, target)
+
+        monkeypatch.setattr(_Path, "rename", fake_rename)
+
+        def broken_copy2(src, dst, **kwargs):
+            _shutil.copyfile(src, dst)
+            Path(dst).write_bytes(b"truncated")  # wrong size on purpose
+
+        monkeypatch.setattr("episodematch.postprocess.renamer.shutil.copy2", broken_copy2)
+        with pytest.raises(RenameError, match="size"):
+            renamer.apply(self.plan_of(source, destination))
+        assert source.exists()  # untouched: the copy failed before any delete
+        temps = list(destination.parent.glob(".*emtmp*"))
+        assert temps == []  # the bad staged copy was cleaned up
+
+    def plan_of(self, source: Path, destination: Path):
+        from episodematch.postprocess.renamer import RenamePlan, RenamePlanItem
+
+        return RenamePlan(items=[RenamePlanItem(source=source, destination=destination)])

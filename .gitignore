@@ -39,3 +39,6 @@ htmlcov/
 *.swp
 Thumbs.db
 Desktop.ini
+
+# --- Export packages (hand-off bundles, not part of the repo) ---
+_export/

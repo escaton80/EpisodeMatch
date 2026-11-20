@@ -426,6 +426,7 @@ def format_episode_name(
     episode: int,
     title: str,
     extension: str = ".mkv",
+    episode_end: int | None = None,
     **extra: str,
 ) -> str:
     """Render a naming template into a relative path (or file name).
@@ -433,6 +434,11 @@ def format_episode_name(
     Supported placeholders: ``{series}``, ``{season}``, ``{episode}``, ``{title}``,
     zero-padded variants ``{season:2d}`` / ``{episode:2d}`` / ``{episode:3d}`` and any
     extra keyword placeholders. Each rendered *component* is sanitized for Windows.
+
+    Review 1.1: with ``episode_end`` set (a disc entry published as "1-2"), the
+    default template renders the episode as Jellyfin's multi-episode form
+    automatically — ``{episode:02d}`` becomes ``01-E02`` — without requiring a
+    custom template. ``{episode_end}`` is additionally available as a raw value.
     """
     values: dict[str, str] = {
         "series": series,
@@ -441,12 +447,23 @@ def format_episode_name(
         "episode": str(episode),
         **{key: str(value) for key, value in extra.items()},
     }
+    if episode_end is not None:
+        values["episode_end"] = str(episode_end)
+
+    def _episode_part(padding: str | None) -> str:
+        width = int(padding) if padding is not None else None
+        start = f"{episode:0{width}d}" if width is not None else str(episode)
+        if episode_end is not None and episode_end > episode:
+            end = f"{episode_end:0{width}d}" if width is not None else str(episode_end)
+            return f"{start}-E{end}"
+        return start
 
     def _sub(match: re.Match[str]) -> str:
         token, padding = match.group(1), match.group(2)
-        if padding is not None and token in ("season", "episode"):
-            number = season if token == "season" else episode
-            return str(number).zfill(int(padding))
+        if token == "episode":
+            return _episode_part(padding)
+        if padding is not None and token == "season":
+            return str(season).zfill(int(padding))
         if token not in values:
             raise ConfigError(f"Unknown placeholder {{{token}}} in naming template")
         return values[token]
