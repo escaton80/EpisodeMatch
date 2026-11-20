@@ -452,6 +452,22 @@ class TestPathResolution:
         monkeypatch.setattr(sys, "executable", str(exe_dir / "EpisodeMatch.exe"))
         assert AppConfig().resolve_path("bin") == exe_dir / "bin"
 
+    def test_dev_anchor_without_venv_still_finds_checkout(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """CI runners install the interpreter into a hosted cache (no pyproject
+        marker around sys.prefix) while the editable install still runs from
+        the checkout — the anchor must fall back to the module's own repo root."""
+        import sys
+
+        from episodematch.core import config as config_module
+
+        fake_prefix = tmp_path / "hosted" / "python312"  # no pyproject marker anywhere above
+        fake_prefix.mkdir(parents=True)
+        monkeypatch.setattr(sys, "prefix", str(fake_prefix))
+        monkeypatch.setattr(sys, "frozen", False, raising=False)
+        root = config_module._dev_anchor()
+        assert root is not None
+        assert (root / "pyproject.toml").is_file()
+
     def test_resolve_path_falls_back_to_project_root(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Started from a foreign CWD (double-clicked shim), bin/data resolve to
         the checkout instead of being created in the wrong place."""

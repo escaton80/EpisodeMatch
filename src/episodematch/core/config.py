@@ -171,10 +171,12 @@ def find_project_root(start: Path | None = None) -> Path | None:
 def _dev_anchor() -> Path | None:
     """Path root for relative ``bin``/``data`` resolution.
 
-    Source checkout: the project root (found via ``sys.prefix``). Frozen build
-    (audit F2): the directory of the running executable — a shortcut launched
-    from an arbitrary CWD must not fork tools/configuration/cache into that
-    directory.
+    Source checkout: the project root (found via ``sys.prefix`` — the venv
+    inside the checkout — or, when the interpreter has no checkout marker
+    around it (CI runners install into a hosted cache, plain installs), via
+    this module's own location inside the checkout). Frozen build (audit F2):
+    the directory of the running executable — a shortcut launched from an
+    arbitrary CWD must not fork tools/configuration/cache into that directory.
     """
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
@@ -182,7 +184,10 @@ def _dev_anchor() -> Path | None:
     for candidate in (prefix, *prefix.parents):
         if (candidate / "pyproject.toml").is_file():
             return candidate
-    return None
+    # Review CI: actions/setup-python places the interpreter in a hosted cache
+    # with no checkout marker — the editable install still runs from the
+    # checkout, so anchor at the module's own repository root.
+    return find_project_root(Path(__file__))
 
 
 def _resolve_relative(path: Path) -> Path:
