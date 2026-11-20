@@ -33,4 +33,4 @@ jobs:
       - name: Install EpisodeMatch with dev + GUI extras
         run: pip install -e .[dev,gui]
       - name: Run the test suite (offline)
-        run: pytest -q
+        run: python -m pytest -q
