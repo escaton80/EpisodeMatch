@@ -20,9 +20,10 @@ jobs:
         python-version: ["3.11", "3.12"]
     env:
       QT_QPA_PLATFORM: offscreen
-      # Full pytest output on CI (the Qt-suite hard exit would otherwise
-      # swallow the failure details the moment anything breaks).
-      EM_NO_HARD_EXIT: "1"
+      # EM_QT_TESTS=1 keeps the deterministic hard exit active: PySide6 can
+      # segfault during interpreter teardown AFTER every test passed — the
+      # hard exit reports the true test result instead of a teardown crash.
+      # (Diagnose failures by temporarily setting EM_NO_HARD_EXIT=1.)
       EM_QT_TESTS: "1"
       PYTEST_ADDOPTS: --tb=short
     steps:
