@@ -20,6 +20,11 @@ jobs:
         python-version: ["3.11", "3.12"]
     env:
       QT_QPA_PLATFORM: offscreen
+      # Full pytest output on CI (the Qt-suite hard exit would otherwise
+      # swallow the failure details the moment anything breaks).
+      EM_NO_HARD_EXIT: "1"
+      EM_QT_TESTS: "1"
+      PYTEST_ADDOPTS: --tb=short
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
