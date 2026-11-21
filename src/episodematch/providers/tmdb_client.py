@@ -168,6 +168,18 @@ class TmdbClient:
         if series.tmdb_id is None:
             raise ProviderError(f"Series {series.name!r} has no TMDB id", provider="tmdb")
         payload = self._get(f"/tv/{series.tmdb_id}/season/{season}")
+        # Carry the series' IMDb id from the official /external_ids endpoint:
+        # the IMDb enrichment then goes straight to /title/{imdb_id}/episodes/
+        # instead of scraping IMDb's /find endpoint, which is protected by bot
+        # mitigations (HTTP 202 soft blocks) and fails on real scans.
+        if series.imdb_id is None:
+            try:
+                external = self._get(f"/tv/{series.tmdb_id}/external_ids")
+                imdb_id = external.get("imdb_id")
+                if imdb_id:
+                    series.imdb_id = imdb_id
+            except ProviderError as exc:
+                logger.debug("External ids unavailable for TMDB %s: %s", series.tmdb_id, exc)
         episodes: list[EpisodeInfo] = []
         for raw in payload.get("episodes") or []:
             crew = raw.get("crew") or []
@@ -206,4 +218,18 @@ class TmdbClient:
                     tmdb_id=raw.get("id"),
                 )
             )
-        return SeasonGuide(series=series, season=season, episodes=episodes)
+        guide = SeasonGuide(series=series, season=season, episodes=episodes)
+        # PILLAR4_PLAN batch 3.5: series-level cast names for the visual pillar's
+        # hint-only evidence (main-cast cards confirm the series, no score).
+        # The season-DETAILS payload has no cast — it lives on the dedicated
+        # season credits endpoint.
+        try:
+            credits_payload = self._get(f"/tv/{series.tmdb_id}/season/{season}/credits")
+            guide.cast = [
+                str(member.get("name"))
+                for member in credits_payload.get("cast") or []
+                if member.get("name")
+            ]
+        except ProviderError as exc:
+            logger.debug("Season credits unavailable for TMDB %s: %s", series.tmdb_id, exc)
+        return guide

@@ -47,7 +47,13 @@ from episodematch.extractors.frame_scanner import FrameScanner
 from episodematch.extractors.ffprobe_reader import FfprobeReader
 from episodematch.extractors.ocr_engine import OcrEngine
 from episodematch.extractors.subtitle_extractor import SubtitleExtractor
-from episodematch.matcher.credit_scorer import credit_evidence, score_episode_credits
+from episodematch.matcher.credit_scorer import (
+    _find_hit_for_name,
+    build_credit_idf,
+    credit_evidence,
+    match_name,
+    score_episode_credits,
+)
 from episodematch.matcher.llm_arbiter import LlmArbiter, LlmSettings, merge_verdict_into_candidates
 from episodematch.matcher.solver import exclude_covered_episodes, solve_assignment
 
@@ -233,7 +239,13 @@ class Pipeline:
 
     def _ocr_engine(self) -> OcrEngine:
         if self._ocr is None:
-            self._ocr = OcrEngine(bin_dir=self._config.resolved_bin_dir, language="en-US")
+            preference = self._config.extraction.ocr_backend
+            preferred = [preference] if preference and preference.lower() != "auto" else None
+            self._ocr = OcrEngine(
+                bin_dir=self._config.resolved_bin_dir,
+                language="en-US",
+                preferred=preferred,
+            )
         return self._ocr
 
     def _subtitle_service(self) -> SubtitleExtractor:
@@ -460,12 +472,34 @@ class Pipeline:
         for episode, (_candidate, disc_title) in self._disc_episode_titles.items():
             if episode in titles:
                 titles[episode] = disc_title
+        # PILLAR4_PLAN batch 5: normalize by the sum of ACTIVE pillar weights —
+        # a single-pillar scan (DVD outside the DiscDB, no subtitles) gets its
+        # evidence on the full confidence scale. "Active" means the pillar
+        # actually CONTRIBUTED evidence to a candidate: an enabled-but-empty
+        # pillar (DiscDB miss, subtitle quota exhausted) must not raise the
+        # threshold for the pillars that did work — otherwise the GUI's
+        # default-enabled disc_db+subtitles suppress every visual-only match.
+        contributing_scores: dict[str, float] = {}
+        for candidate in candidates:
+            for evidence in candidate.evidence:
+                pillar_name = evidence.pillar.value
+                if evidence.score > contributing_scores.get(pillar_name, 0.0):
+                    contributing_scores[pillar_name] = evidence.score
+        active_pillars = [
+            name
+            for name in ("disc_db", "subtitle", "audio", "visual", "llm")
+            if contributing_scores.get(name, 0.0) > 0.0
+        ]
+        weight_sum = (
+            sum(getattr(self._config.matching.weights, name, 0.0) for name in active_pillars) or None
+        )
         solved = solve_assignment(
             candidates,
             episode_numbers,
             titles,
             season=season,
             min_confidence=self._config.matching.min_assignment_confidence,
+            weight_sum=weight_sum,
         )
         report.assignment.entries = solved.entries
         report.assignment.unassigned = solved.unassigned
@@ -1014,6 +1048,15 @@ class Pipeline:
             "guest": self._config.matching.credit_weight_guest,
             "title": self._config.matching.credit_weight_title,
         }
+        # PILLAR4_PLAN batch 3: normalized season-IDF for credit names — a
+        # name credited in every episode fades to zero (>= 3 episodes; below
+        # that the scoring stays unweighted and is logged).
+        self._credit_idf = build_credit_idf(guide)
+        if self._credit_idf is None:
+            logger.info(
+                "Credit IDF needs >= 3 guide episodes — credit scoring stays unweighted (N=%d)",
+                len(guide.episodes),
+            )
         total_files = len(probed)
         for index, (mkv, candidate) in enumerate(probed):
             if self._cancelled():
@@ -1025,7 +1068,15 @@ class Pipeline:
                 percent=(index + 1) / total_files * 100.0,
             )
             try:
-                hits = scanner.scan(mkv.path, duration_seconds=mkv.duration_seconds)
+                # PILLAR4_PLAN batch 2.8: the MKV chapter marks anchor the dense
+                # title-card probe zone (the episode title appears around the
+                # end of the first chapter).
+                chapter_marks = [chapter.start_seconds for chapter in mkv.chapters if chapter.start_seconds > 0]
+                hits = scanner.scan(
+                    mkv.path,
+                    duration_seconds=mkv.duration_seconds,
+                    chapter_marks=chapter_marks or None,
+                )
             except EpisodeMatchError as exc:
                 self._report(report, mkv.file_name, "visual", "failed", str(exc))
                 continue
@@ -1039,23 +1090,114 @@ class Pipeline:
             best_score = 0.0
             best_episode: int | None = None
             for episode in guide.episodes:
-                credit_score = score_episode_credits(hits, episode, weights=weights, name_threshold=self._config.matching.name_match_threshold)
+                credit_score = score_episode_credits(
+                    hits,
+                    episode,
+                    weights=weights,
+                    name_threshold=self._config.matching.name_match_threshold,
+                    credit_idf=self._credit_idf,
+                    series=guide.series,
+                    file_duration=mkv.duration_seconds,
+                )
                 if credit_score.score <= 0.0:
                     continue
                 for evidence in credit_evidence(hits, credit_score):
                     candidate.add_evidence(evidence)
+                # PILLAR4_PLAN batch 3: transparent summary — the top matches
+                # with their timestamp (MM:SS) and the recognized OCR text.
+                top_matches = sorted(credit_score.matches, key=lambda m: m.ratio, reverse=True)[:3]
+                top_details: list[dict] = []
+                summary_parts: list[str] = []
+                for match in top_matches:
+                    source_hit = _find_hit_for_name(hits, match.ocr_name)
+                    timestamp = source_hit.timestamp_seconds if source_hit else None
+                    mmss = f"{int(timestamp) // 60:02d}:{int(timestamp) % 60:02d}" if timestamp is not None else "?"
+                    top_details.append(
+                        {
+                            "ocr_text": match.ocr_name,
+                            "credited": match.credited_name,
+                            "role": match.role,
+                            "ratio": round(match.ratio, 1),
+                            "timestamp_seconds": timestamp,
+                        }
+                    )
+                    summary_parts.append(f"{match.ocr_name!r} at {mmss} ({match.ratio:.0f}%)")
                 candidate.add_evidence(
                     Evidence(
                         pillar=Pillar.VISUAL,
                         kind="credits_summary",
                         score=credit_score.score,
-                        summary=f"{episode.code}: {len(credit_score.matches)} credit matches ({credit_score.score:.0%})",
-                        details={"matches": [m.credited_name for m in credit_score.matches]},
+                        summary=(
+                            f"{episode.code}: {len(credit_score.matches)} credit matches ({credit_score.score:.0%})"
+                            + (" — " + "; ".join(summary_parts) if summary_parts else "")
+                        ),
+                        details={
+                            "matches": [m.credited_name for m in credit_score.matches],
+                            "top": top_details,
+                        },
                         episode_hint=episode.episode,
                     )
                 )
                 if credit_score.score > best_score:
                     best_score, best_episode = credit_score.score, episode.episode
+            # PILLAR4_PLAN batch 3.5: a series-cast name on a card confirms the
+            # series choice — hint-only evidence, NO episode score (the user
+            # picked the series; main-cast cards appear in every episode).
+            if guide.cast:
+                for hit in hits:
+                    for name in (*hit.directors, *hit.guest_stars, *hit.writers):
+                        found = match_name(name, guide.cast, threshold=self._config.matching.name_match_threshold)
+                        if not found:
+                            # The Voyager-style cards print only the LAST name
+                            # ("PICARDO", "MULGREW") in capitals — compare it
+                            # against the cast members' last names before
+                            # giving up on the hint.
+                            words = name.split()
+                            if words:
+                                last_names = [member.split()[-1].lower() for member in guide.cast]
+                                found_last = match_name(words[-1].lower(), last_names, threshold=90.0)
+                                if found_last:
+                                    full_name = guide.cast[last_names.index(found_last[0])]
+                                    found = (full_name, found_last[1])
+                        if found:
+                            candidate.add_evidence(
+                                Evidence(
+                                    pillar=Pillar.VISUAL,
+                                    kind="series_cast_hint",
+                                    score=0.0,
+                                    summary=(
+                                        f"Series cast {found[0]!r} on card at "
+                                        f"{int(hit.timestamp_seconds) // 60:02d}:"
+                                        f"{int(hit.timestamp_seconds) % 60:02d} — confirms the series, "
+                                        "no episode score"
+                                    ),
+                                    details={
+                                        "ocr_text": name,
+                                        "cast_name": found[0],
+                                        "ratio": round(found[1], 1),
+                                        "timestamp_seconds": hit.timestamp_seconds,
+                                    },
+                                )
+                            )
+            if best_episode is None:
+                # PILLAR4_PLAN batch 2.7: zero-match files record WHAT was
+                # probed and what the OCR read — "No evidence recorded" hides
+                # the calibration data a user needs.
+                top_texts = [line for hit in hits for line in hit.raw_lines][:3]
+                candidate.add_evidence(
+                    Evidence(
+                        pillar=Pillar.VISUAL,
+                        kind="visual_no_match",
+                        score=0.0,
+                        summary=(
+                            f"{len(hits)} frames probed (title+credits windows) — no episode-discriminative "
+                            f"credit/title match; OCR top text: {top_texts[0]!r}"
+                            if top_texts
+                            else f"{len(hits)} frames probed — OCR read nothing recognizable"
+                        ),
+                        details={"frame_count": len(hits), "top_raw": top_texts},
+                    )
+                )
             if best_episode is not None:
                 self._report(report, mkv.file_name, "visual", "ok", f"Best credits match E{best_episode:02d} ({best_score:.0%})")
             else:

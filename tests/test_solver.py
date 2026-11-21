@@ -253,3 +253,73 @@ class TestExcludeCoveredEpisodes:
 
         candidates = [MatchCandidate(file_path=Path("D:/rips/title_t00.mkv"))]
         assert exclude_covered_episodes([1, 2, 3], candidates) == [1, 2, 3]
+
+class TestActivePillarThresholdScaling:
+    """PILLAR4_PLAN batch 5: the confidence threshold scales with the sum of
+    ACTIVE pillar weights (max. up to the full 1.0-scale) — a DVD with no
+    DiscDB entry and no subtitles is identified by pillar 4 alone (a 100%
+    title match is assignable), while all-pillar scans keep the plain 0.55
+    threshold. The reported confidences stay the honest absolute scores."""
+
+    def test_single_pillar_scan_gets_scaled_threshold(self) -> None:
+        from episodematch.matcher.solver import solve_assignment
+
+        candidate = MatchCandidate(
+            file_path=Path("D:/rips/title_t00.mkv"),
+            episode_scores={1: 0.35},  # title match alone: 0.35 * 1.0
+        )
+        solved = solve_assignment(
+            [candidate],
+            [1, 2, 3],
+            {1: "Prototype", 2: "Second", 3: "Third"},
+            season=1,
+            min_confidence=0.55,
+            weight_sum=0.20,  # only the visual pillar is active
+        )
+        assert solved.entries, "a 100% single-pillar match must be assignable"
+        assert solved.entries[0].episode == 1
+        assert solved.entries[0].confidence == pytest.approx(0.35)  # honest absolute score
+
+    def test_two_pillar_scan_gets_proportionally_scaled_threshold(self) -> None:
+        from episodematch.matcher.solver import solve_assignment
+
+        candidate = MatchCandidate(
+            file_path=Path("D:/rips/title_t00.mkv"),
+            episode_scores={1: 0.70},  # disc 0.40 + visual 0.30
+        )
+        solved = solve_assignment(
+            [candidate],
+            [1, 2],
+            {1: "E1", 2: "E2"},
+            season=1,
+            min_confidence=0.55,
+            weight_sum=0.55,  # disc 0.35 + visual 0.20
+        )
+        # threshold 0.55 * 0.55 = 0.3025 -> 0.70 assigned, confidence honest
+        assert solved.entries and solved.entries[0].confidence == pytest.approx(0.70)
+
+    def test_full_pillar_weight_sum_keeps_plain_threshold(self) -> None:
+        """With every pillar active (weight sum >= 1.0) the threshold stays
+        the plain 0.55 — multi-pillar behaviour is unchanged."""
+        from episodematch.matcher.solver import solve_assignment
+
+        candidate = MatchCandidate(
+            file_path=Path("D:/rips/title_t00.mkv"),
+            episode_scores={1: 0.70},
+        )
+        solved = solve_assignment(
+            [candidate],
+            [1],
+            {1: "E1"},
+            season=1,
+            min_confidence=0.55,
+            weight_sum=1.40,  # all pillars active
+        )
+        assert solved.entries and solved.entries[0].confidence == pytest.approx(0.70)
+
+    def test_without_weight_sum_behaviour_unchanged(self) -> None:
+        from episodematch.matcher.solver import solve_assignment
+
+        candidate = MatchCandidate(file_path=Path("D:/rips/title_t00.mkv"), episode_scores={1: 0.35})
+        solved = solve_assignment([candidate], [1], {1: "E1"}, season=1, min_confidence=0.55)
+        assert solved.entries == []  # 0.35 < 0.55: legacy behaviour preserved

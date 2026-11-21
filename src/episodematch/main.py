@@ -17,8 +17,12 @@ from episodematch.core.binaries import TOOL_NAMES, ToolResolver
 from episodematch.core.config import AppConfig, ConfigStore, apply_env_overrides
 from episodematch.core.database import CacheDatabase
 from episodematch.core.exceptions import EpisodeMatchError
-from episodematch.core.models import ProgressEvent
+from episodematch.core.models import ProgressEvent, SeasonGuide, TitleCardHit
+from episodematch.extractors.ffprobe_reader import FfprobeReader
+from episodematch.extractors.frame_scanner import FrameScanner
+from episodematch.extractors.ocr_engine import OcrEngine
 from episodematch.matcher.pipeline import Pipeline, ScanOptions, ScanReport
+from episodematch.providers.tmdb_client import TmdbClient
 
 logger = logging.getLogger("episodematch")
 
@@ -218,6 +222,157 @@ def _cmd_fetch_tools(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_debug_visual(args: argparse.Namespace) -> int:
+    """Pillar-4 diagnostics (PILLAR4_PLAN batch 1): raw OCR per frame.
+
+    Runs the same frame scan the pipeline uses, but keeps UNKNOWN frames with
+    their raw text, never deletes the extracted PNGs, and prints everything a
+    human (or `--json`) needs to calibrate title-card/credits recognition.
+    """
+    config = _load_config()
+    mkv = Path(args.file)
+    if not mkv.is_file():
+        print(f"Error: file not found: {mkv}", file=sys.stderr)
+        return 1
+
+    resolver = ToolResolver(config.resolved_bin_dir)
+
+    def _tool(name: str) -> Path:
+        # Diagnostics keep running without the tools — the scan reports the
+        # concrete failures per window instead of aborting the command.
+        try:
+            return resolver.tool_path(name)
+        except EpisodeMatchError:
+            return config.resolved_bin_dir / name
+
+    duration: float | None = None
+    try:
+        mkv_info = FfprobeReader(_tool("ffprobe")).probe(mkv)
+        duration = mkv_info.duration_seconds
+    except EpisodeMatchError as exc:
+        print(f"  note: ffprobe unavailable ({exc}) — scanning with default windows", file=sys.stderr)
+
+    guide: SeasonGuide | None = None
+    if args.series and args.season:
+        try:
+            tmdb = TmdbClient(config.tmdb_api_key)
+            series_info = tmdb.find_series(args.series)
+            guide = tmdb.season_guide(series_info, args.season)
+        except EpisodeMatchError as exc:
+            print(f"  note: TMDB guide unavailable ({exc}) — showing OCR only", file=sys.stderr)
+
+    debug_dir = Path(args.save_frames) if args.save_frames else config.resolved_data_dir / "frames" / "debug" / mkv.stem
+    preference = config.extraction.ocr_backend
+    preferred = [preference] if preference and preference.lower() != "auto" else None
+    ocr = OcrEngine(bin_dir=config.resolved_bin_dir, language="en-US", preferred=preferred)
+    scanner = FrameScanner(
+        ffmpeg_path=_tool("ffmpeg"),
+        ffprobe_path=_tool("ffprobe"),
+        ocr=ocr,
+        work_dir=debug_dir,
+        keep_frames=True,
+        scene_threshold=config.extraction.scene_change_threshold,
+        max_frames_per_window=config.extraction.max_frames_per_window,
+        title_card_minutes=config.extraction.title_card_window_minutes,
+    )
+
+    name_threshold = config.matching.name_match_threshold
+    # PILLAR4_PLAN batch 2.8: the chapter marks anchor the dense title-card
+    # probe zone — the CLI diagnostics path must behave exactly like the GUI.
+    chapter_marks = [
+        chapter.start_seconds
+        for chapter in (mkv_info.chapters if mkv_info else [])
+        if chapter.start_seconds > 0
+    ]
+    hits = scanner.debug_scan(mkv, duration_seconds=duration, chapter_marks=chapter_marks or None)
+    timings = scanner.last_timings
+
+    def _mmss(seconds: float) -> str:
+        total = int(seconds)
+        return f"{total // 60:02d}:{total % 60:02d}"
+
+    if args.json:
+        payload = {
+            "file": str(mkv),
+            "duration_seconds": duration,
+            "timings_seconds": {key: round(value, 2) for key, value in timings.items()},
+            "frames": [
+                {
+                    "timestamp_seconds": hit.timestamp_seconds,
+                    "timestamp": _mmss(hit.timestamp_seconds),
+                    "kind": hit.kind.value,
+                    "ocr_confidence": hit.ocr_confidence,
+                    "raw_lines": hit.raw_lines,
+                    "directors": hit.directors,
+                    "writers": hit.writers,
+                    "guest_stars": hit.guest_stars,
+                    "title_candidates": hit.title_candidates,
+                    "potential_hits": (
+                        _frame_potential_hits(hit, guide, name_threshold=name_threshold) if guide else []
+                    ),
+                }
+                for hit in hits
+            ],
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    duration_note = f"{duration:.0f} s" if duration else "unknown"
+    print(f"Debug visual scan: {mkv.name} (duration {duration_note})")
+    print(f"  frames kept in {debug_dir}")
+    for hit in hits:
+        print(f"  {_mmss(hit.timestamp_seconds)}  {hit.kind.value:10s}  conf={hit.ocr_confidence if hit.ocr_confidence is not None else '-'}")
+        for line in hit.raw_lines:
+            print(f"      | {line}")
+        if guide:
+            for potential in _frame_potential_hits(hit, guide, name_threshold=name_threshold):
+                print(f"      -> {potential}")
+    print(
+        f"  phases: scene {timings.get('scene', 0.0):.1f}s / extract {timings.get('extract', 0.0):.1f}s / "
+        f"ocr {timings.get('ocr', 0.0):.1f}s"
+    )
+    return 0
+
+
+def _frame_potential_hits(hit: TitleCardHit, guide: SeasonGuide, *, name_threshold: float) -> list[str]:
+    """Human-readable potential credit/title hits of one frame against the guide."""
+    from rapidfuzz import fuzz
+
+    from episodematch.matcher.credit_scorer import match_name
+    from episodematch.matcher.text_scorer import normalize_episode_text
+
+    results: list[str] = []
+    for episode in guide.episodes:
+        for name, credited in (
+            [(name, episode.directors) for name in hit.directors]
+            + [(name, episode.writers) for name in hit.writers]
+            + [(name, [guest.name for guest in episode.guest_stars]) for name in hit.guest_stars]
+        ):
+            found = match_name(name, credited, threshold=name_threshold)
+            if found:
+                results.append(f"{episode.code}: {name!r} matches {found[0]!r} ({found[1]:.0f}%)")
+        for candidate in hit.title_candidates:
+            ratio = fuzz.token_sort_ratio(
+                normalize_episode_text(candidate), normalize_episode_text(episode.title)
+            )
+            if ratio >= 80:
+                results.append(f"{episode.code}: title {candidate!r} matches {episode.title!r} ({ratio:.0f}%)")
+    # Series-cast hints (PILLAR4_PLAN batch 3.5): a main-cast name on a card
+    # confirms the series choice — hint-only, no episode score. The cards
+    # print only the LAST name ("PICARDO"), so compare last names.
+    for name in (*hit.directors, *hit.guest_stars, *hit.writers):
+        words = name.split()
+        if not words:
+            continue
+        for member in guide.cast:
+            member_words = member.split()
+            if not member_words:
+                continue
+            if words[-1].lower() == member_words[-1].lower():
+                results.append(f"{name!r} is series cast ({member!r}) — confirms the series, no episode score")
+    return results
+
+
 def _cmd_match(args: argparse.Namespace) -> int:
     config = _load_config()
     folder = Path(args.folder)
@@ -324,6 +479,16 @@ def build_parser() -> argparse.ArgumentParser:
     env_parser.add_argument("--fix", action="store_true", help="also download missing tools")
     env_parser.set_defaults(func=_cmd_check_env)
 
+    debug_parser = sub.add_parser(
+        "debug-visual",
+        help="pillar-4 diagnostics: raw OCR text + classification for every extracted frame",
+    )
+    debug_parser.add_argument("file", help="one .mkv file to inspect")
+    debug_parser.add_argument("--series", help="series name for potential-hit matching against the TMDB guide")
+    debug_parser.add_argument("--season", type=int, help="season number for the TMDB guide")
+    debug_parser.add_argument("--save-frames", help="copy the extracted PNGs to this directory")
+    debug_parser.add_argument("--json", action="store_true", help="machine-readable JSON output")
+    debug_parser.set_defaults(func=_cmd_debug_visual)
     fetch_parser = sub.add_parser("fetch-tools", help="download missing ffmpeg/MKVToolNix binaries into ./bin/")
     fetch_parser.add_argument("--force", nargs="*", choices=list(TOOL_NAMES), help="re-download even if present")
     fetch_parser.set_defaults(func=_cmd_fetch_tools)

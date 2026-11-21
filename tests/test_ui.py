@@ -666,3 +666,36 @@ class TestScanProgressDisplay:
         view._on_scan_finished(make_report())
         caption = view._progress_caption.text()
         assert "Done" in caption
+
+class TestDepthPromotion:
+    """A manually checked deep-only pillar must not be silently disabled by
+    the Fast/Medium presets — the scan promotes itself to Deep (observed: a
+    Voyager DVD scan with only Title-card OCR checked finished 0/7 in seconds
+    because Medium kept the visual pillar gated)."""
+
+    def test_visual_checkbox_promotes_medium_to_deep(self, qapp: QApplication, ui_context: AppContext) -> None:
+        view = WorkspaceView(ui_context)
+        view._depth_combo.setCurrentIndex(1)  # Medium
+        view._pillar_checks["use_visual"].setChecked(True)
+        options = view._build_scan_options()
+        assert options.depth == "deep"
+        assert options.use_visual is True
+
+    def test_fast_preset_with_visual_checkbox_promotes_too(self, qapp: QApplication, ui_context: AppContext) -> None:
+        view = WorkspaceView(ui_context)
+        view._depth_combo.setCurrentIndex(0)  # Fast
+        view._pillar_checks["use_visual"].setChecked(True)
+        options = view._build_scan_options()
+        assert options.depth == "deep"
+
+    def test_no_deep_pillars_stays_in_preset(self, qapp: QApplication, ui_context: AppContext) -> None:
+        view = WorkspaceView(ui_context)
+        view._depth_combo.setCurrentIndex(0)  # Fast, DiscDB only
+        assert view._deep_pillars_requested() is False
+        assert view._build_scan_options().depth == "fast"
+
+    def test_deep_pillars_requested_reflects_checkboxes(self, qapp: QApplication, ui_context: AppContext) -> None:
+        view = WorkspaceView(ui_context)
+        assert view._deep_pillars_requested() is False  # Medium default
+        view._pillar_checks["use_audio"].setChecked(True)
+        assert view._deep_pillars_requested() is True

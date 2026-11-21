@@ -385,6 +385,12 @@ class TestConfig:
         assert "abcdefghijk" not in masked["tmdb_api_key"]
         assert masked["llm_api_key"] == ""
 
+    def test_ocr_backend_setting_default_auto(self) -> None:
+        """PILLAR4_PLAN batch 4 (RapidOCR evaluation): the OCR backend for the
+        visual pillar is configurable — "auto" keeps the WinRT-first chain."""
+        config = AppConfig()
+        assert config.extraction.ocr_backend == "auto"
+
     def test_masked_keys_cover_subdl(self) -> None:
         """Audit F1: the SubDL API key must be masked like the other keys."""
         config = AppConfig(
@@ -615,3 +621,204 @@ class TestReadOnlyDatabase:
                 ro._conn.execute("CREATE TABLE should_fail (x INT)")
         finally:
             ro.close()
+
+class TestDebugVisualCommand:
+    """Pillar-4 batch 1: episodematch debug-visual exposes raw OCR per frame,
+    optional potential hits against the TMDB guide, and --json output."""
+
+    @staticmethod
+    def _patched_env(tmp_path: Path, config: AppConfig, monkeypatch: pytest.MonkeyPatch, hits: list) -> Path:
+        from episodematch.core.models import MkvFile
+
+        mkv = tmp_path / "title_t00.mkv"
+        mkv.write_bytes(b"x")
+
+        class FakeScanner:
+            def __init__(self, **kwargs) -> None:  # noqa: ANN003
+                self.kwargs = kwargs
+                self.last_timings = {"scene": 1.2, "extract": 0.8, "ocr": 2.5}
+
+            def debug_scan(self, mkv_path, *, duration_seconds=None, max_frames=None, chapter_marks=None):  # noqa: ANN001, ANN202
+                return hits
+
+        class FakeProbe:
+            def probe(self, path, **kwargs):  # noqa: ANN001, ANN003
+                return MkvFile(path=Path(path), size_bytes=1, duration_seconds=2400.0)
+
+        monkeypatch.setattr("episodematch.main.FrameScanner", FakeScanner)
+        monkeypatch.setattr("episodematch.main.FfprobeReader", lambda *args, **kwargs: FakeProbe())
+        monkeypatch.setattr("episodematch.main.ConfigStore.load", lambda self: config)
+        return mkv
+
+    def test_debug_visual_prints_frames(self, tmp_path: Path, config: AppConfig, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch) -> None:
+        from episodematch.core.models import TitleCardHit, TitleCardKind
+
+        mkv = self._patched_env(
+            tmp_path,
+            config,
+            monkeypatch,
+            [
+                TitleCardHit(timestamp_seconds=61.0, kind=TitleCardKind.CREDITS, raw_lines=["Directed by Michelle MacLaren"], directors=["Michelle MacLaren"], ocr_confidence=0.9),
+                TitleCardHit(timestamp_seconds=240.0, kind=TitleCardKind.UNKNOWN, raw_lines=[], ocr_confidence=None),
+            ],
+        )
+        from episodematch.main import main
+
+        assert main(["debug-visual", str(mkv)]) == 0
+        out = capsys.readouterr().out
+        assert "01:01" in out  # MM:SS timestamp rendering
+        assert "Directed by Michelle MacLaren" in out
+        assert "unknown" in out.lower()
+
+    def test_debug_visual_json_output(self, tmp_path: Path, config: AppConfig, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch) -> None:
+        import json as _json
+
+        from episodematch.core.models import TitleCardHit, TitleCardKind
+
+        mkv = self._patched_env(
+            tmp_path,
+            config,
+            monkeypatch,
+            [
+                TitleCardHit(timestamp_seconds=61.0, kind=TitleCardKind.CREDITS, raw_lines=["Directed by Michelle MacLaren"], directors=["Michelle MacLaren"], ocr_confidence=0.9),
+                TitleCardHit(timestamp_seconds=240.0, kind=TitleCardKind.UNKNOWN, raw_lines=[], ocr_confidence=None),
+            ],
+        )
+        from episodematch.main import main
+
+        assert main(["debug-visual", str(mkv), "--json"]) == 0
+        payload = _json.loads(capsys.readouterr().out)
+        assert len(payload["frames"]) == 2
+        assert payload["frames"][0]["timestamp_seconds"] == 61.0
+        assert payload["frames"][0]["kind"] == "credits"
+        assert payload["frames"][1]["raw_lines"] == []
+
+    def test_debug_visual_with_series_shows_potential_hits(self, tmp_path: Path, config: AppConfig, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch) -> None:
+        from episodematch.core.models import (
+            EpisodeInfo,
+            GuestStar,
+            SeriesInfo,
+            SeasonGuide,
+            TitleCardHit,
+            TitleCardKind,
+        )
+
+        mkv = self._patched_env(
+            tmp_path,
+            config,
+            monkeypatch,
+            [
+                TitleCardHit(
+                    timestamp_seconds=61.0,
+                    kind=TitleCardKind.CREDITS,
+                    raw_lines=["Directed by Michelle MacLaren"],
+                    directors=["Michelle MacLaren"],
+                    guest_stars=["Bryan Cranston"],
+                    title_candidates=["Pilot"],
+                    ocr_confidence=0.9,
+                ),
+                TitleCardHit(timestamp_seconds=240.0, kind=TitleCardKind.UNKNOWN, raw_lines=[]),
+            ],
+        )
+        series = SeriesInfo(name="Test Show", tmdb_id=42, imdb_id="tt1", first_air_year=2020)
+        guide = SeasonGuide(
+            series=series,
+            season=1,
+            episodes=[
+                EpisodeInfo(
+                    season=1,
+                    episode=1,
+                    title="Pilot",
+                    plot="p",
+                    directors=["Michelle MacLaren"],
+                    guest_stars=[GuestStar(name="Bryan Cranston")],
+                ),
+                EpisodeInfo(season=1, episode=2, title="Second", plot="p"),
+            ],
+        )
+
+        class FakeTmdb:
+            def __init__(self, api_key: str) -> None:
+                self.api_key = api_key
+
+            def find_series(self, query: str, **kwargs):  # noqa: ANN001, ANN202
+                return series
+
+            def season_guide(self, series_info, season):  # noqa: ANN001, ANN202
+                return guide
+
+        monkeypatch.setattr("episodematch.main.TmdbClient", FakeTmdb)
+        from episodematch.main import main
+
+        assert main(["debug-visual", str(mkv), "--series", "Test Show", "--season", "1"]) == 0
+        out = capsys.readouterr().out
+        assert "S01E01" in out  # potential hits reference the matching episode
+        assert "Michelle MacLaren" in out
+        assert "Pilot" in out
+
+    def test_debug_visual_shows_series_cast_hints(self, tmp_path: Path, config: AppConfig, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A series-cast name on a card ("PICARDO" last-name-only) is shown as
+        a series-confirmation hint — no episode score."""
+        from episodematch.core.models import (
+            GuestStar,
+            MkvFile,
+            SeriesInfo,
+            SeasonGuide,
+            EpisodeInfo,
+            TitleCardHit,
+            TitleCardKind,
+        )
+
+        mkv = tmp_path / "title_t00.mkv"
+        mkv.write_bytes(b"x")
+        hits = [
+            TitleCardHit(
+                timestamp_seconds=212.0,
+                kind=TitleCardKind.CREDITS,
+                raw_lines=["PICARDO as The Doctor"],
+                guest_stars=["PICARDO"],
+                ocr_confidence=0.9,
+            ),
+            TitleCardHit(timestamp_seconds=240.0, kind=TitleCardKind.UNKNOWN, raw_lines=[]),
+        ]
+
+        class FakeScanner:
+            def __init__(self, **kwargs) -> None:  # noqa: ANN003
+                self.last_timings = {"scene": 1.0, "extract": 1.0, "ocr": 1.0}
+
+            def debug_scan(self, mkv_path, *, duration_seconds=None, max_frames=None, chapter_marks=None):  # noqa: ANN001, ANN202
+                return hits
+
+        class FakeProbe:
+            def probe(self, path, **kwargs):  # noqa: ANN001, ANN003
+                return MkvFile(path=Path(path), size_bytes=1, duration_seconds=2400.0)
+
+        monkeypatch.setattr("episodematch.main.FrameScanner", FakeScanner)
+        monkeypatch.setattr("episodematch.main.FfprobeReader", lambda *args, **kwargs: FakeProbe())
+
+        series = SeriesInfo(name="Voyager", tmdb_id=46533, imdb_id="tt1", first_air_year=2020)
+        guide = SeasonGuide(
+            series=series,
+            season=2,
+            episodes=[EpisodeInfo(season=2, episode=1, title="The 37's", plot="p")],
+            cast=["Robert Picardo", "Kate Mulgrew"],
+        )
+
+        class FakeTmdb:
+            def __init__(self, api_key: str) -> None:
+                self.api_key = api_key
+
+            def find_series(self, query: str, **kwargs):  # noqa: ANN001, ANN202
+                return series
+
+            def season_guide(self, series_info, season):  # noqa: ANN001, ANN202
+                return guide
+
+        monkeypatch.setattr("episodematch.main.TmdbClient", FakeTmdb)
+        monkeypatch.setattr("episodematch.main.ConfigStore.load", lambda self: config)
+        from episodematch.main import main
+
+        assert main(["debug-visual", str(mkv), "--series", "Voyager", "--season", "2"]) == 0
+        out = capsys.readouterr().out
+        assert "series cast" in out and "Robert Picardo" in out
+        assert "confirms the series" in out

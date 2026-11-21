@@ -387,6 +387,28 @@ class TestCreditExtraction:
         result = extract_credits_from_lines(["Written by Vince Gilligan and Peter Gould"])
         assert result.writers == ["Vince Gilligan", "Peter Gould"]
 
+    def test_split_line_card_structure_name_as_character(self) -> None:
+        """RapidOCR splits credit cards into separate lines: 'ROBERT PICARDO' /
+        'as' / 'The Doctor'. The 'as' line links the previous line (name) and
+        the next line (character) into a guest star."""
+        result = extract_credits_from_lines(["ROBERT PICARDO", "as", "The Doctor"])
+        assert result.guest_stars == ["ROBERT PICARDO"]
+        assert result.kind.value == "credits"
+
+    def test_split_line_card_ignores_dangling_as(self) -> None:
+        """A dangling 'as' (no preceding name line) adds no guest star —
+        the following line stays a title candidate at most."""
+        result = extract_credits_from_lines(["as", "The Doctor"])
+        assert result.guest_stars == []
+
+    def test_bare_starring_prefix_multiline(self) -> None:
+        """RapidOCR splits the card into lines: 'Starring' / 'KATE MULGREW' /
+        'dS' / 'Captain Kathryn Janeway'. The bare 'Starring' prefix (without
+        'guest') must still capture the following name line."""
+        result = extract_credits_from_lines(["Starring", "KATE MULGREW", "dS", "Captain Kathryn Janeway"])
+        assert result.guest_stars == ["KATE MULGREW"]
+        assert result.kind.value == "credits"
+
     def test_height_boost_for_big_text(self) -> None:
         result = extract_credits_from_lines(["Quick"], line_heights=[120])
         assert "Quick" in result.title_candidates
@@ -1103,3 +1125,555 @@ class TestScanWindowPlumbing:
         monkeypatch.setattr(scanner, "detect_scene_changes", fake_detect)
         scanner.scan(tmp_path / "title_t00.mkv", duration_seconds=2400.0)
         assert (0.0, 120.0) in captured  # 2-minute title window, not the 5-minute default
+
+class TestDebugScan:
+    """Pillar-4 batch 1: debug_scan is the diagnostics view of scan() — it
+    keeps UNKNOWN frames with their raw OCR text and never deletes PNGs."""
+
+    class QueueOcr:
+        name = "fake"
+
+        def __init__(self, results: list[list[tuple[str, int, float]]]) -> None:
+            self._results = list(results)
+
+        def probe(self):
+            from episodematch.extractors.ocr_engine import BackendAvailability
+
+            return BackendAvailability(self.name, True)
+
+        def recognize(self, image):
+            from episodematch.core.models import OcrLine, OcrResult
+
+            item = self._results.pop(0) if self._results else []
+            lines = [
+                OcrLine(text=line_text, x=0, y=0, width=100, height=height, confidence=confidence)
+                for line_text, height, confidence in item
+            ]
+            return OcrResult(lines=lines, backend="fake", language="en-US")
+
+    def _scanner(self, tmp_path: Path, ocr_results: list[list[tuple[str, int, float]]]):
+        from episodematch.extractors.frame_scanner import FrameScanner
+
+        scanner = FrameScanner(
+            ffmpeg_path=tmp_path / "ffmpeg.exe",
+            ffprobe_path=tmp_path / "ffprobe.exe",
+            ocr=self.QueueOcr(ocr_results),
+            work_dir=tmp_path / "frames",
+            keep_frames=False,
+            max_frames_per_window=10,
+        )
+
+        def fake_extract(mkv_path, timestamp, window_name):
+            from PIL import Image as PILImage
+
+            out = tmp_path / "frames" / f"f_{window_name}_{timestamp:.3f}.png"
+            # Strong per-frame color variation so the RMS dedupe keeps all of
+            # them (the OCR queue below is indexed per extracted frame).
+            color = (int(timestamp) * 40) % 255
+            PILImage.new("RGB", (64, 36), (color, 40, 30)).save(out)
+            return out
+
+        scanner.extract_frame = fake_extract
+        # Distinct timestamps per window so hits sort deterministically.
+        scanner.detect_scene_changes = lambda mkv, start, end, limit: (
+            [10.0, 20.0, 30.0] if start == 0.0 else [40.0, 50.0, 60.0]
+        )
+        return scanner
+
+    def _ocr_results(self) -> list[list[tuple[str, int, float]]]:
+        credits = [("Directed by Michelle MacLaren", 40, 0.9)]
+        noise = [("a random lowercase phrase with no meaning", 10, 0.4)]
+        title = [("The Long Night", 40, 0.9)]
+        # The batch-2 retry consumes one extra result per empty-OCR frame.
+        return [credits, noise, [], [], title, [], [], [], []]  # two windows x three frames
+
+    def test_debug_scan_keeps_unknown_and_empty_frames(self, tmp_path: Path) -> None:
+        scanner = self._scanner(tmp_path, self._ocr_results())
+        hits = scanner.debug_scan(Path("D:/disc/title_t00.mkv"))
+        # uniform mix (title: 10 s grid = 30 probes, no cap; credits: cap 10)
+        # + cuts, deduped: 43 frames total, every frame reported — even empty OCR.
+        assert len(hits) == 43
+        kinds = {hit.kind.value for hit in hits}
+        assert "credits" in kinds and "title_card" in kinds and "unknown" in kinds
+        assert any(hit.raw_lines == [] for hit in hits)  # "OCR saw nothing" is visible
+        assert all(hit.timestamp_seconds > 0 for hit in hits)
+
+    def test_normal_scan_discards_unknown_and_empty(self, tmp_path: Path) -> None:
+        scanner = self._scanner(tmp_path, self._ocr_results())
+        hits = scanner.scan(Path("D:/disc/title_t00.mkv"))
+        kinds = {hit.kind.value for hit in hits}
+        assert kinds == {"credits", "title_card"}  # unknown/empty frames discarded
+
+    def test_debug_scan_keeps_png_files(self, tmp_path: Path) -> None:
+        scanner = self._scanner(tmp_path, self._ocr_results())
+        scanner.debug_scan(Path("D:/disc/title_t00.mkv"))
+        pngs = list((tmp_path / "frames").glob("*.png"))
+        assert len(pngs) >= 6  # diagnostics never delete the extracted frames (cuts + uniform mix)
+
+class TestDedupeHardening:
+    """Pillar-4 batch 2: kept frames keep a small minimum gap (<= 1.5 s), so
+    fast-cutting credits (>= 1.0 s apart) are never collapsed, while fade
+    sequences (< gap + visually near-identical) still collapse to one frame.
+    The RMS comparison runs against ALL previously kept frames."""
+
+    def _scanner(self, tmp_path: Path) -> object:
+        from episodematch.extractors.frame_scanner import FrameScanner
+
+        return FrameScanner(
+            ffmpeg_path=tmp_path / "ffmpeg.exe",
+            ffprobe_path=tmp_path / "ffprobe.exe",
+            ocr=TestDebugScan.QueueOcr([]),
+            work_dir=tmp_path / "frames",
+            keep_frames=False,
+            max_frames_per_window=10,
+        )
+
+    @staticmethod
+    def _frames(tmp_path: Path, specs: list[tuple[float, tuple[int, int, int]]]) -> list[tuple[float, Path]]:
+        from PIL import Image as PILImage
+
+        frames_dir = tmp_path / "frames"
+        frames_dir.mkdir(exist_ok=True)
+        out = []
+        for index, (timestamp, color) in enumerate(specs):
+            path = frames_dir / f"f_{index}.png"
+            PILImage.new("RGB", (64, 36), color).save(path)
+            out.append((timestamp, path))
+        return out
+
+    def test_frames_one_second_apart_are_never_dropped(self, tmp_path: Path) -> None:
+        scanner = self._scanner(tmp_path)
+        frames = self._frames(
+            tmp_path,
+            [(0.0, (10, 10, 10)), (1.2, (10, 10, 10)), (2.4, (10, 10, 10))],  # identical pixels
+        )
+        kept = scanner.deduplicate_frames(frames)
+        assert [t for t, _ in kept] == [0.0, 1.2, 2.4]  # >= 1.0 s gap: never dropped despite RMS
+
+    def test_close_similar_frames_collapse(self, tmp_path: Path) -> None:
+        scanner = self._scanner(tmp_path)
+        frames = self._frames(tmp_path, [(0.0, (10, 10, 10)), (0.3, (12, 12, 12))])  # fade: 0.3 s + similar
+        kept = scanner.deduplicate_frames(frames)
+        assert [t for t, _ in kept] == [0.0]
+
+    def test_close_but_different_frames_both_kept(self, tmp_path: Path) -> None:
+        scanner = self._scanner(tmp_path)
+        frames = self._frames(tmp_path, [(0.0, (10, 10, 10)), (0.3, (200, 40, 30))])  # different cards
+        kept = scanner.deduplicate_frames(frames)
+        assert [t for t, _ in kept] == [0.0, 0.3]
+
+    def test_rms_compares_against_all_kept(self, tmp_path: Path) -> None:
+        """A-B-A pattern: the third frame resembles the FIRST kept frame, not
+        the previous — the all-kept comparison drops it (previous-only would
+        keep it, because its predecessor B looks different)."""
+        scanner = self._scanner(tmp_path)
+        frames = self._frames(
+            tmp_path,
+            [(0.0, (10, 10, 10)), (0.4, (200, 40, 30)), (0.8, (10, 10, 10))],  # A-B-A within the gap window
+        )
+        kept = scanner.deduplicate_frames(frames)
+        assert [t for t, _ in kept] == [0.0, 0.4]
+
+
+class TestCreditsFallbackSampling:
+    """Pillar-4 batch 2: static credits rolls have no scene cuts — when the
+    credits window yields fewer than 3 timestamps, uniform sampling takes over
+    so slow-rolling credits are scanned at all."""
+
+    def _scanner(self, tmp_path: Path, cuts: list[float], ocr_lines: list[str]) -> tuple[object, list[float]]:
+        from episodematch.extractors.frame_scanner import FrameScanner
+
+        scanner = FrameScanner(
+            ffmpeg_path=tmp_path / "ffmpeg.exe",
+            ffprobe_path=tmp_path / "ffprobe.exe",
+            ocr=TestDebugScan.QueueOcr([[(line, 30, 0.9)] for line in ocr_lines]),
+            work_dir=tmp_path / "frames",
+            keep_frames=False,
+            max_frames_per_window=8,
+        )
+
+        def fake_extract(mkv_path, timestamp, window_name):
+            from PIL import Image as PILImage
+
+            out = tmp_path / "frames" / f"f_{window_name}_{timestamp:.3f}.png"
+            PILImage.new("RGB", (64, 36), (5, 5, 5)).save(out)
+            return out
+
+        scanner.extract_frame = fake_extract
+
+        def fake_detect(mkv, start, end, limit):
+            return [c for c in cuts if start <= c <= end]
+
+        scanner.detect_scene_changes = fake_detect
+        return scanner, []
+
+    def test_few_cuts_trigger_uniform_fallback(self, tmp_path: Path) -> None:
+        scanner, _ = self._scanner(tmp_path, [451.0], ["Directed by Michelle MacLaren"] * 150)
+        # duration 4155 s -> credits window = last 12 % (3677..4155)
+        hits = scanner.scan(Path("D:/disc/title_t00.mkv"), duration_seconds=4155.0)
+        credit_hits = [h for h in hits if h.timestamp_seconds >= 3677.0]
+        assert len(credit_hits) == 8  # uniform count = cap 8 (the cut at 451 s is outside this window)
+        timestamps = [h.timestamp_seconds for h in credit_hits]
+        assert all(3677.0 <= t <= 4155.0 for t in timestamps)
+        assert timestamps == sorted(timestamps)
+        spread = max(timestamps) - min(timestamps)
+        assert spread > 300.0  # evenly spread across the window, not clustered
+
+    def test_enough_cuts_keep_scene_timestamps(self, tmp_path: Path) -> None:
+        cuts = [3690.0, 3900.0, 4050.0]  # 3 cuts: real scene changes, no fallback
+        scanner, _ = self._scanner(tmp_path, cuts, ["Directed by Michelle MacLaren"] * 150)
+        hits = scanner.scan(Path("D:/disc/title_t00.mkv"), duration_seconds=4155.0)
+        credit_hits = [h.timestamp_seconds for h in hits if h.timestamp_seconds >= 3677.0]
+        assert all(cut in credit_hits for cut in cuts), f"credit_hits: {credit_hits}"
+
+    def test_title_window_also_gets_uniform_mix(self, tmp_path: Path) -> None:
+        """Batch 2.5: the uniform mix applies to BOTH windows — title cards can
+        be crossfades with zero scene cuts (measured on Voyager S2)."""
+        scanner, _ = self._scanner(tmp_path, [], ["Directed by Michelle MacLaren"] * 12)
+        hits = scanner.scan(Path("D:/disc/title_t00.mkv"), duration_seconds=4155.0)
+        title_hits = [h for h in hits if h.timestamp_seconds < 300.0]
+        assert title_hits, "the title window must be probed even without cuts"
+
+
+class TestOcrRetry:
+    """Pillar-4 batch 2: when OCR reads nothing from the raw frame, one retry
+    on a grayscale contrast-threshold variant runs (white text on dark/noisy
+    backgrounds). The original stays the first attempt."""
+
+    class FlipOcr:
+        """Empty result for RGB input, text for the grayscale retry variant."""
+
+        name = "flip"
+
+        def __init__(self) -> None:
+            self.modes: list[str] = []
+            self.original_noise = False
+
+        def probe(self):
+            from episodematch.extractors.ocr_engine import BackendAvailability
+
+            return BackendAvailability(self.name, True)
+
+        def recognize(self, image):
+            from episodematch.core.models import OcrLine, OcrResult
+
+            self.modes.append(image.mode)
+            if image.mode == "L":
+                return OcrResult(
+                    lines=[OcrLine(text="DIRECTED BY RECOVERED", x=0, y=0, width=100, height=40, confidence=0.9)],
+                    backend=self.name,
+                    language="en-US",
+                )
+            if self.original_noise:
+                # RapidOCR on a crossfade: boxes detected, text is whitespace/noise
+                return OcrResult(
+                    lines=[
+                        OcrLine(text="：", x=0, y=0, width=10, height=10, confidence=0.62),
+                        OcrLine(text="11", x=0, y=10, width=10, height=10, confidence=0.61),
+                    ],
+                    backend=self.name,
+                    language="en-US",
+                )
+            return OcrResult(lines=[], backend=self.name, language="en-US")
+
+    def test_noise_only_lines_trigger_retry(self, tmp_path: Path) -> None:
+        """RapidOCR detects boxes on crossfade frames but reads only whitespace
+        / noise (measured: conf 0.5-0.62 with empty text on Voyager fades) —
+        that must trigger the grayscale retry exactly like an empty result."""
+        from PIL import Image as PILImage
+
+        from episodematch.extractors.frame_scanner import FrameScanner
+
+        ocr = self.FlipOcr()
+        scanner = FrameScanner(
+            ffmpeg_path=tmp_path / "ffmpeg.exe",
+            ffprobe_path=tmp_path / "ffprobe.exe",
+            ocr=ocr,
+            work_dir=tmp_path / "frames",
+            keep_frames=False,
+        )
+        frame = tmp_path / "frames" / "f.png"
+        frame.parent.mkdir(parents=True, exist_ok=True)
+        PILImage.new("RGB", (64, 36), (5, 5, 5)).save(frame)
+
+        # FlipOcr returns noise for RGB and text for the L variant — the noise
+        # lines are pure punctuation/digits with no alphanumerics.
+        ocr.original_noise = True
+        hit = scanner.classify_frame(frame, 1.0)
+        assert hit is not None
+        assert hit.raw_lines == ["DIRECTED BY RECOVERED"]
+        assert ocr.modes == ["RGB", "L"]
+
+    def test_empty_ocr_retries_on_contrast_variant(self, tmp_path: Path) -> None:
+        from PIL import Image as PILImage
+
+        from episodematch.extractors.frame_scanner import FrameScanner
+
+        ocr = self.FlipOcr()
+        scanner = FrameScanner(
+            ffmpeg_path=tmp_path / "ffmpeg.exe",
+            ffprobe_path=tmp_path / "ffprobe.exe",
+            ocr=ocr,
+            work_dir=tmp_path / "frames",
+            keep_frames=False,
+        )
+        frame = tmp_path / "frames" / "f.png"
+        frame.parent.mkdir(parents=True, exist_ok=True)
+        PILImage.new("RGB", (64, 36), (5, 5, 5)).save(frame)
+
+        hit = scanner.classify_frame(frame, 1.0)
+        assert hit is not None
+        assert hit.raw_lines == ["DIRECTED BY RECOVERED"]  # recovered via the retry
+        assert ocr.modes == ["RGB", "L"]  # original first, grayscale variant second
+
+class TestTitleWindowUniformMix:
+    """Pillar-4 batch 2 (measured on Voyager S2): title cards are NOT always
+    scene cuts — on a static starfield they appear as slow crossfades. The
+    title window therefore always mixes uniform probes with the detected
+    cuts, and the final cap is applied evenly so late-window frames survive."""
+
+    def _scanner(self, tmp_path: Path, cuts: list[float]) -> object:
+        from episodematch.extractors.frame_scanner import FrameScanner
+
+        scanner = FrameScanner(
+            ffmpeg_path=tmp_path / "ffmpeg.exe",
+            ffprobe_path=tmp_path / "ffprobe.exe",
+            ocr=TestDebugScan.QueueOcr([]),
+            work_dir=tmp_path / "frames",
+            keep_frames=False,
+            max_frames_per_window=5,
+        )
+
+        def fake_extract(mkv_path, timestamp, window_name):
+            from PIL import Image as PILImage
+
+            out = tmp_path / "frames" / f"f_{window_name}_{timestamp:.3f}.png"
+            color = (int(timestamp) * 40) % 255
+            PILImage.new("RGB", (64, 36), (color, 40, 30)).save(out)
+            return out
+
+        scanner.extract_frame = fake_extract
+
+        def fake_detect(mkv, start, end, limit):
+            return [c for c in cuts if start <= c <= end]
+
+        scanner.detect_scene_changes = fake_detect
+        return scanner
+
+    def test_title_window_covers_late_crossfaded_cards(self, tmp_path: Path) -> None:
+        """Cuts only in the opening cluster (42/77 s), title card at ~247 s as
+        a crossfade — the uniform mix must probe the late window too."""
+        scanner = self._scanner(tmp_path, [42.0, 77.0])
+        hits = scanner.debug_scan(Path("D:/disc/title_t00.mkv"), duration_seconds=2641.0)
+        timestamps = [h.timestamp_seconds for h in hits if h.timestamp_seconds <= 300.0]
+        assert any(t >= 240.0 for t in timestamps), f"late title cards missed: {timestamps}"
+        assert any(t <= 100.0 for t in timestamps), f"early cuts lost: {timestamps}"
+
+    def test_title_window_probe_budget_applies_evenly(self, tmp_path: Path) -> None:
+        """The 10 s probe budget is applied evenly across the whole window
+        (first-N truncation would lose the late 04:07 card)."""
+        scanner = self._scanner(tmp_path, [42.0, 77.0, 120.0, 160.0, 200.0, 247.0, 280.0])
+        hits = scanner.debug_scan(Path("D:/disc/title_t00.mkv"), duration_seconds=2641.0)
+        timestamps = [h.timestamp_seconds for h in hits if h.timestamp_seconds <= 300.0]
+        # the 10 s uniform grid over a 300 s window (30 probes) + dense zones
+        assert len(timestamps) == 37
+        assert max(timestamps) >= 240.0  # the late 04:07 area survives
+        assert min(timestamps) <= 60.0  # and the early cluster survives
+
+class TestTitleProbeDensity:
+    """Pillar-4 batch 2.6: the title window is probed on a ~10 s grid — crossfade
+    cards stay visible for 5-10 s, so a dense grid hits them even without cuts."""
+
+    def _scanner(self, tmp_path: Path, cuts: list[float]) -> object:
+        from episodematch.extractors.frame_scanner import FrameScanner
+
+        scanner = FrameScanner(
+            ffmpeg_path=tmp_path / "ffmpeg.exe",
+            ffprobe_path=tmp_path / "ffprobe.exe",
+            ocr=TestDebugScan.QueueOcr([]),
+            work_dir=tmp_path / "frames",
+            keep_frames=False,
+            max_frames_per_window=40,
+        )
+
+        def fake_extract(mkv_path, timestamp, window_name):
+            from PIL import Image as PILImage
+
+            out = tmp_path / "frames" / f"f_{window_name}_{timestamp:.3f}.png"
+            color = (int(timestamp) * 40) % 255
+            PILImage.new("RGB", (64, 36), (color, 40, 30)).save(out)
+            return out
+
+        scanner.extract_frame = fake_extract
+        scanner.detect_scene_changes = lambda mkv, start, end, limit: [c for c in cuts if start <= c <= end]
+        return scanner
+
+    def test_title_grid_hits_observed_card_positions(self, tmp_path: Path) -> None:
+        """Measured cards at 02:50/03:01/03:20/03:40 (Voyager S2) — a 10 s grid
+        must have a probe within +-5 s of each card window."""
+        scanner = self._scanner(tmp_path, [42.0])
+        hits = scanner.debug_scan(Path("D:/disc/title_t00.mkv"), duration_seconds=2641.0)
+        timestamps = [h.timestamp_seconds for h in hits if h.timestamp_seconds <= 300.0]
+        assert any(170.0 <= t <= 190.0 for t in timestamps), f"card ~181 s missed: {timestamps}"
+        assert any(195.0 <= t <= 205.0 for t in timestamps), f"card ~200 s missed: {timestamps}"
+        assert any(215.0 <= t <= 225.0 for t in timestamps), f"card ~220 s missed: {timestamps}"
+
+    def test_cuts_are_always_probed_too(self, tmp_path: Path) -> None:
+        scanner = self._scanner(tmp_path, [42.0, 247.0])
+        hits = scanner.debug_scan(Path("D:/disc/title_t00.mkv"), duration_seconds=2641.0)
+        timestamps = [h.timestamp_seconds for h in hits if h.timestamp_seconds <= 300.0]
+        assert any(abs(t - 42.0) < 1.0 for t in timestamps)  # the cut itself
+        assert any(abs(t - 247.0) < 1.0 for t in timestamps)  # and the late cut
+
+class TestPreferredBackendSelection:
+    """PILLAR4_PLAN batch 4 (RapidOCR evaluation measured): RapidOCR reads the
+    Voyager cast cards far better than WinRT (0.92-0.99 vs misreads), so the
+    OCR backend is configurable per settings."""
+
+    def test_ocr_engine_prefers_rapidocr_when_requested(self, tmp_path: Path) -> None:
+        from episodematch.extractors.ocr_engine import OcrEngine
+
+        engine = OcrEngine(bin_dir=tmp_path, language="en-US", preferred=["rapidocr"])
+        backend = engine.backend
+        assert backend.name == "rapidocr"  # rapidocr is installed in this venv
+
+    def test_ocr_engine_default_keeps_winrt_first(self, tmp_path: Path) -> None:
+        from episodematch.extractors.ocr_engine import OcrEngine
+
+        engine = OcrEngine(bin_dir=tmp_path, language="en-US")
+        assert engine.backend.name in ("winrt", "rapidocr")  # first available in chain order
+
+    def test_pipeline_passes_ocr_backend_preference(self, tmp_path: Path, config: AppConfig) -> None:
+        from episodematch.core.config import ExtractionSettings
+        from episodematch.matcher.pipeline import Pipeline
+
+        config = config.model_copy(
+            update={"extraction": ExtractionSettings(ocr_backend="rapidocr")}
+        )
+        pipeline = Pipeline(config, ffprobe=None, disc_db_client=None, tmdb=None)
+        engine = pipeline._ocr_engine()
+        assert engine._preferred == ["rapidocr"]
+
+class TestChapterZoneProbing:
+    """Pillar-4 batch 2.8 (user observation on Voyager DVDs): the episode title
+    card appears right before and after the END of the first chapter — the
+    chapter marks are read from the MKV and the probe grid is densified
+    (+-10 s at 2.5 s steps) around every mark inside the title window."""
+
+    def _scanner(self, tmp_path: Path, cuts: list[float]) -> object:
+        from episodematch.extractors.frame_scanner import FrameScanner
+
+        scanner = FrameScanner(
+            ffmpeg_path=tmp_path / "ffmpeg.exe",
+            ffprobe_path=tmp_path / "ffprobe.exe",
+            ocr=TestDebugScan.QueueOcr([]),
+            work_dir=tmp_path / "frames",
+            keep_frames=False,
+            max_frames_per_window=60,
+        )
+
+        def fake_extract(mkv_path, timestamp, window_name):
+            from PIL import Image as PILImage
+
+            out = tmp_path / "frames" / f"f_{window_name}_{timestamp:.3f}.png"
+            color = (int(timestamp) * 40) % 255
+            PILImage.new("RGB", (64, 36), (color, 40, 30)).save(out)
+            return out
+
+        scanner.extract_frame = fake_extract
+        scanner.detect_scene_changes = lambda mkv, start, end, limit: [c for c in cuts if start <= c <= end]
+        return scanner
+
+    def test_chapter_end_gets_dense_probes(self, tmp_path: Path) -> None:
+        """Chapter 2 starts at 180 s (= chapter 1 ends there) — the +-10 s zone
+        is probed at 2.5 s steps: 172.5 ... 187.5."""
+        scanner = self._scanner(tmp_path, [42.0])
+        hits = scanner.debug_scan(
+            Path("D:/disc/title_t00.mkv"),
+            duration_seconds=2641.0,
+            chapter_marks=[180.0],
+        )
+        timestamps = [h.timestamp_seconds for h in hits if h.timestamp_seconds <= 300.0]
+        in_zone = [t for t in timestamps if 170.0 <= t <= 190.0]
+        assert len(in_zone) >= 15, f"dense chapter-zone probes missing: {timestamps}"
+        # uniform probes still cover the rest of the window
+        assert any(t < 100.0 for t in timestamps)
+
+    def test_marks_outside_window_are_ignored(self, tmp_path: Path) -> None:
+        scanner = self._scanner(tmp_path, [42.0])
+        hits = scanner.debug_scan(
+            Path("D:/disc/title_t00.mkv"),
+            duration_seconds=2641.0,
+            chapter_marks=[180.0, 1500.0],
+        )
+        title_ts = [h.timestamp_seconds for h in hits if h.timestamp_seconds <= 300.0]
+        assert title_ts  # the in-window mark still got its dense zone
+        assert all(t <= 300.0 for t in title_ts)  # out-of-window mark: no probes
+
+    def test_no_chapter_marks_keeps_uniform_grid(self, tmp_path: Path) -> None:
+        scanner = self._scanner(tmp_path, [42.0])
+        hits_chapters = scanner.debug_scan(
+            Path("D:/disc/title_t00.mkv"),
+            duration_seconds=2641.0,
+            chapter_marks=[180.0],
+        )
+        hits_plain = scanner.debug_scan(Path("D:/disc/title_t00.mkv"), duration_seconds=2641.0)
+        # the dense zone adds probes the plain grid does not have
+        with_chapters = {h.timestamp_seconds for h in hits_chapters if 170.0 <= h.timestamp_seconds <= 190.0}
+        without = {h.timestamp_seconds for h in hits_plain if 170.0 <= h.timestamp_seconds <= 190.0}
+        assert len(with_chapters) > len(without)
+
+class TestNoCapEviction:
+    """Pillar-4 batch 2.9 (regression from the chapter-zone change): with the
+    adaptive grid the kept-frames list grew beyond the cap and the evenly
+    selection EVICTED card frames — the Voyager scan dropped from 5/7 to 2/7.
+    The title window keeps every distinct frame (cuts + 5 s uniform + dense
+    chapter zones); the OCR cost stays low (~70 frames x 0.1 s)."""
+
+    def _scanner(self, tmp_path: Path, cuts: list[float], max_frames: int) -> object:
+        from episodematch.extractors.frame_scanner import FrameScanner
+
+        scanner = FrameScanner(
+            ffmpeg_path=tmp_path / "ffmpeg.exe",
+            ffprobe_path=tmp_path / "ffprobe.exe",
+            ocr=TestDebugScan.QueueOcr([]),
+            work_dir=tmp_path / "frames",
+            keep_frames=False,
+            max_frames_per_window=max_frames,
+        )
+
+        def fake_extract(mkv_path, timestamp, window_name):
+            from PIL import Image as PILImage
+
+            out = tmp_path / "frames" / f"f_{window_name}_{timestamp:.3f}.png"
+            color = (int(timestamp) * 40) % 255
+            PILImage.new("RGB", (64, 36), (color, 40, 30)).save(out)
+            return out
+
+        scanner.extract_frame = fake_extract
+        scanner.detect_scene_changes = lambda mkv, start, end, limit: [c for c in cuts if start <= c <= end]
+        return scanner
+
+    def test_cap_never_evicts_chapter_zone_frames(self, tmp_path: Path) -> None:
+        """Tiny cap + many cuts: the dense chapter-zone probes and the uniform
+        grid must ALL survive — the cap may only evict near-duplicates."""
+        scanner = self._scanner(
+            tmp_path,
+            [42.0, 77.0, 120.0, 160.0, 200.0, 247.0, 280.0],
+            max_frames=5,  # tiny cap: pre-fix, evenly would evict most frames
+        )
+        hits = scanner.debug_scan(
+            Path("D:/disc/title_t00.mkv"),
+            duration_seconds=2641.0,
+            chapter_marks=[180.0],
+        )
+        timestamps = [h.timestamp_seconds for h in hits if h.timestamp_seconds <= 300.0]
+        # the dense chapter zone (172.5-187.5 at 2.5 s) must be fully present
+        zone = [t for t in timestamps if 170.0 <= t <= 190.0]
+        assert len(zone) >= 6, f"chapter zone evicted: {timestamps}"
+        # and the cut at 247 s plus late uniform probes survive too
+        assert any(abs(t - 247.0) < 1.0 for t in timestamps)
+        assert any(t >= 240.0 for t in timestamps)
+
+
+

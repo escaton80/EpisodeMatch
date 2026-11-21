@@ -187,6 +187,7 @@ def solve_assignment(
     season: int = 1,
     min_confidence: float = 0.55,
     max_confidence: float = 1.0,
+    weight_sum: float | None = None,
 ) -> SolvedAssignment:
     """Assign every file at most one episode, and every episode at most one file.
 
@@ -207,12 +208,21 @@ def solve_assignment(
 
     raw_matrix = build_score_matrix(candidates, episode_numbers)
     finite = np.nan_to_num(raw_matrix, nan=0.0, posinf=0.0, neginf=0.0)
+    # PILLAR4_PLAN batch 5: the confidence threshold scales with the sum of
+    # ACTIVE pillar weights (max. up to the full 1.0-scale) — a single-pillar
+    # scan (DVD with no DiscDB entry, no subtitles) gets its 100% title match
+    # assigned instead of being suppressed by the inactive pillars' weight
+    # sum. All-pillar scans keep the plain 0.55 threshold, and the reported
+    # confidences stay the honest absolute pillar scores.
+    effective_min = min_confidence
+    if weight_sum is not None and weight_sum > 0:
+        effective_min = min_confidence * min(1.0, weight_sum)
     # Audit A3: the confidence threshold is part of the assignment problem.
     # Sub-threshold cells are inadmissible — they must not shape the global
     # assignment (otherwise the optimizer prefers two 0.54 cells over one
     # feasible 0.90 match and discards everything). The raw matrix is kept for
     # best-guess reporting.
-    assignable = np.where(finite >= min_confidence, finite, 0.0)
+    assignable = np.where(finite >= effective_min, finite, 0.0)
     max_score = float(assignable.max()) or 1.0
     cost_matrix = (max_score - assignable).tolist()
 
@@ -228,7 +238,7 @@ def solve_assignment(
         score = float(assignable[row, col])
         candidate = candidates[row]
         episode = episode_numbers[col]
-        if score < min_confidence:
+        if score < effective_min:
             # The optimizer assigned an inadmissible (zeroed) cell — nothing
             # usable for this file.
             solved.unassigned.append(

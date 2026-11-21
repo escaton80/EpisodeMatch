@@ -274,7 +274,7 @@ class TestPipelineDeepPath:
         mkv2 = make_mkv("title_t01.mkv", mpls="00801.mpls", duration=41 * 60 + 55, size=2_011_000_000)
 
         class FakeVisual:
-            def scan(self, mkv_path, *, duration_seconds=None, max_frames=None):  # noqa: ANN001, ANN202
+            def scan(self, mkv_path, *, duration_seconds=None, max_frames=None, chapter_marks=None):  # noqa: ANN001, ANN202
                 from episodematch.core.models import TitleCardHit, TitleCardKind
 
                 if mkv_path.name == "title_t00.mkv":
@@ -573,7 +573,7 @@ class TestProgressPerFile:
         events: list[ProgressEvent] = []
 
         class FakeVisual:
-            def scan(self, mkv_path, *, duration_seconds=None, max_frames=None):  # noqa: ANN001, ANN202
+            def scan(self, mkv_path, *, duration_seconds=None, max_frames=None, chapter_marks=None):  # noqa: ANN001, ANN202
                 return []
 
         pipeline = build_pipeline(
@@ -815,3 +815,145 @@ class TestReferenceIdfAndSync:
         sync_evidence = [e for e in candidate.evidence if e.kind == "sync_check"]
         assert sync_evidence, "a >20 s reference offset must be reported as evidence"
         assert "different master" in sync_evidence[0].summary
+
+class TestVisualOnlyDvdScan:
+    """PILLAR4_PLAN batch 5 (user case): DVDs outside the DiscDB with no
+    subtitles — pillar 4 alone must assign the episode from a 100% title-card
+    match after the active-pillar normalization."""
+
+    def test_visual_only_scan_assigns_by_title_match(
+        self, config: AppConfig, tmp_path: Path
+    ) -> None:
+        from episodematch.core.models import MkvFile, TitleCardHit, TitleCardKind
+
+        (tmp_path / "dvd_rip.mkv").write_bytes(b"x")  # the scan globs the folder
+        mkv = MkvFile(path=tmp_path / "dvd_rip.mkv", size_bytes=1, duration_seconds=2641.0)
+        hits = [
+            TitleCardHit(
+                timestamp_seconds=248.0,
+                kind=TitleCardKind.TITLE_CARD,
+                raw_lines=["PROTOTYPE"],
+                title_candidates=["PROTOTYPE"],
+                ocr_confidence=0.99,
+            )
+        ]
+
+        class FakeVisual:
+            def scan(self, mkv_path, *, duration_seconds=None, max_frames=None, chapter_marks=None):  # noqa: ANN001, ANN202
+                return hits
+
+        from episodematch.core.models import EpisodeInfo, SeriesInfo
+
+        guide = SeasonGuide(
+            series=SeriesInfo(
+                name="Star Trek: Voyager",
+                tmdb_id=46533,
+                imdb_id="tt2149175",
+                first_air_year=1995,
+            ),
+            season=2,
+            episodes=[
+                EpisodeInfo(
+                    season=2,
+                    episode=13,
+                    title="Prototype",
+                    plot="The Doctor builds a robot prototype",
+                )
+            ],
+        )
+        (tmp_path / "empty-discdb" / "data" / "series").mkdir(parents=True)
+        pipeline = build_pipeline(
+            config,
+            ffprobe=FakeFfprobe({"dvd_rip.mkv": mkv}),
+            disc_db_client=LocalDiscDbImporter(tmp_path / "empty-discdb"),
+            tmdb=FakeTmdb(guide),
+            frame_scanner=FakeVisual(),
+        )
+        report = pipeline.scan_folder(
+            tmp_path,
+            series="Star Trek: Voyager",
+            season=2,
+            options=ScanOptions(depth="deep", use_disc_db=False, use_subtitles=False, use_audio=False, use_llm=False),
+        )
+        assert report.assignment.entries, "the 100% title match must be assignable"
+        entry = report.assignment.entries[0]
+        assert entry.episode == 13
+        assert entry.episode_title == "Prototype"
+        # honest absolute score (0.35 title weight) — the assignment decision
+        # used the scaled threshold (only the visual pillar is active)
+        assert entry.confidence == pytest.approx(0.35)
+
+    def test_enabled_but_empty_pillars_do_not_raise_threshold(
+        self, config: AppConfig, tmp_path: Path
+    ) -> None:
+        """User case v0.12.0: the GUI enables disc_db + subtitles + visual, but
+        the disc is outside the DiscDB and the reference fetch yields nothing —
+        only pillar 4 produces evidence. The threshold must normalize by the
+        pillars that CONTRIBUTED evidence, not by the enabled options —
+        otherwise the 100% title match (0.35) is suppressed by the full-scale
+        0.55 x (0.35+0.30+0.20) = 0.47 gate and EVERYTHING stays unassigned."""
+        from episodematch.core.exceptions import EpisodeMatchError
+        from episodematch.core.models import TitleCardHit, TitleCardKind
+
+        (tmp_path / "dvd_rip.mkv").write_bytes(b"x")  # the scan globs the folder
+        mkv = MkvFile(path=tmp_path / "dvd_rip.mkv", size_bytes=1, duration_seconds=2641.0)
+        hits = [
+            TitleCardHit(
+                timestamp_seconds=248.0,
+                kind=TitleCardKind.TITLE_CARD,
+                raw_lines=["PROTOTYPE"],
+                title_candidates=["PROTOTYPE"],
+                ocr_confidence=0.99,
+            )
+        ]
+
+        class FakeVisual:
+            def scan(self, mkv_path, *, duration_seconds=None, max_frames=None, chapter_marks=None):  # noqa: ANN001, ANN202
+                return hits
+
+        class FakeBrokenExtractor:
+            """Subtitle stage enabled, but extraction fails per file (no tools
+            / no usable track) — exactly the 'enabled but empty' case."""
+
+            def extract_all(self, mkv, **kwargs):  # noqa: ANN001, ANN202
+                raise EpisodeMatchError("no mkvextract available")
+
+        guide = SeasonGuide(
+            series=SeriesInfo(
+                name="Star Trek: Voyager",
+                tmdb_id=46533,
+                imdb_id="tt2149175",
+                first_air_year=1995,
+            ),
+            season=2,
+            episodes=[
+                EpisodeInfo(
+                    season=2,
+                    episode=13,
+                    title="Prototype",
+                    plot="The Doctor builds a robot prototype",
+                )
+            ],
+        )
+        (tmp_path / "empty-discdb" / "data" / "series").mkdir(parents=True)
+        pipeline = build_pipeline(
+            config,
+            ffprobe=FakeFfprobe({"dvd_rip.mkv": mkv}),
+            disc_db_client=LocalDiscDbImporter(tmp_path / "empty-discdb"),
+            tmdb=FakeTmdb(guide),
+            subtitle_extractor=FakeBrokenExtractor(),
+            frame_scanner=FakeVisual(),
+        )
+        report = pipeline.scan_folder(
+            tmp_path,
+            series="Star Trek: Voyager",
+            season=2,
+            options=ScanOptions(depth="deep", use_disc_db=True, use_subtitles=True, use_audio=False, use_llm=False),
+        )
+        assert report.assignment.entries, (
+            "a 0.35 title match must assign when disc_db/subtitle produced NO evidence "
+            "(weight_sum must be visual-only 0.20, not the enabled-option sum 0.85)"
+        )
+        entry = report.assignment.entries[0]
+        assert entry.episode == 13
+        assert entry.confidence == pytest.approx(0.35)

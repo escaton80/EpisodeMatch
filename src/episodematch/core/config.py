@@ -125,6 +125,10 @@ class ExtractionSettings(BaseModel):
     # Frame scanning (pillar 4): first N minutes + credits window.
     title_card_window_minutes: float = 5.0
     credits_window_fraction: float = 0.12
+    # PILLAR4_PLAN batch 4 (RapidOCR evaluation): "auto" keeps the WinRT-first
+    # chain; "rapidocr" prefers the ONNX backend that reads stylized/stationary
+    # credit cards measurably better (measured on Voyager S2 cast cards).
+    ocr_backend: str = "auto"
     scene_change_threshold: float = 0.30
     max_frames_per_window: int = 12
 

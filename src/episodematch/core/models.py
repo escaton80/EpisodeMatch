@@ -415,6 +415,10 @@ class SeasonGuide(BaseModel):
     series: SeriesInfo
     season: int
     episodes: list[EpisodeInfo] = Field(default_factory=list)
+    # PILLAR4_PLAN batch 3.5: series-level cast names (from the TMDB season
+    # payload) — main-cast names on OCR'd cards confirm the series choice but
+    # are NOT episode-discriminative, so they are hint-only evidence.
+    cast: list[str] = Field(default_factory=list)
 
     def by_number(self, episode: int) -> EpisodeInfo | None:
         for ep in self.episodes:

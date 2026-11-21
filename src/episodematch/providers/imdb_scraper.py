@@ -224,6 +224,16 @@ class ImdbScraper:
             return None
         self._last_request = time.monotonic()
         if response.status_code != 200:
+            if response.status_code == 202:
+                # IMDb's bot protection answers "202 Accepted" with a challenge
+                # page instead of content. Retrying rarely helps — the caller
+                # degrades gracefully and the TMDB guide stays authoritative.
+                logger.info(
+                    "IMDb blocked the request (HTTP 202, bot protection) for %s — "
+                    "skipping IMDb enrichment this run; the TMDB guide is used as-is",
+                    url,
+                )
+                return None
             logger.warning("IMDb returned HTTP %s for %s", response.status_code, url)
             return None
         text = response.text

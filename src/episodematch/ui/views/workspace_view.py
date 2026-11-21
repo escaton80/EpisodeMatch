@@ -200,7 +200,8 @@ class WorkspaceView(QWidget):
         pillars.setSpacing(16)
         self._pillar_checks: dict[str, QCheckBox] = {}
         # Pillars still under development — visible but marked honestly.
-        NOT_READY_PILLARS = {"use_audio", "use_visual", "use_llm"}
+        # (Title-card OCR graduated to production-ready in v0.12.0.)
+        NOT_READY_PILLARS = {"use_audio", "use_llm"}
         for key, label in (
             ("use_disc_db", "Disc DB"),
             ("use_subtitles", "Subtitles"),
@@ -373,7 +374,18 @@ class WorkspaceView(QWidget):
         self._activity_caption.setVisible(True)
         self._activity_caption.setText("")
         self._progress.setValue(0)
-        self._show_banner("info", f"Scanning {folder.name} for {self._selected_series} S{self._season_spin.value():02d}…")
+        banner = f"Scanning {folder.name} for {self._selected_series} S{self._season_spin.value():02d}…"
+        if self._deep_pillars_requested() and self._depth_combo.currentIndex() != 2:
+            deep_names = [
+                label for key, label in (
+                    ("use_audio", "Audio/Whisper"),
+                    ("use_visual", "Title-card OCR"),
+                    ("use_llm", "LLM arbiter"),
+                )
+                if self._pillar_checks[key].isChecked()
+            ]
+            banner = f"{banner} (Deep scan — {', '.join(deep_names)} enabled)"
+        self._show_banner("info", banner)
         self._scan_worker = ScanWorker(
             self._context.config,
             folder,
@@ -388,15 +400,24 @@ class WorkspaceView(QWidget):
         self._scan_worker.failed.connect(self._on_scan_failed)
         self._scan_worker.start()
 
+    def _deep_pillars_requested(self) -> bool:
+        """Whether any deep-only pillar (audio/visual/LLM) is checked."""
+        checks = self._pillar_checks
+        return any(
+            checks[key].isChecked() for key in ("use_audio", "use_visual", "use_llm")
+        )
+
     def _build_scan_options(self):
         from episodematch.matcher.pipeline import ScanOptions
 
         checks = self._pillar_checks
+        # Review UX: a manually checked deep-only pillar must not be silently
+        # disabled by the Fast/Medium presets — the scan promotes itself to
+        # Deep and the banner says so. Fast/Medium still allow the early exit
+        # when DiscDB evidence is conclusive and no deep pillar is requested.
+        depth = "deep" if self._depth_combo.currentIndex() == 2 or self._deep_pillars_requested() else "fast"
         return ScanOptions(
-            # Only the Deep preset enables the deep-only pillars (audio/visual/LLM
-            # are additionally gated by their checkboxes); Fast/Medium allow the
-            # early exit when the DiscDB evidence is already conclusive.
-            depth="deep" if self._depth_combo.currentIndex() == 2 else "fast",
+            depth=depth,
             use_disc_db=checks["use_disc_db"].isChecked(),
             use_subtitles=checks["use_subtitles"].isChecked(),
             use_audio=checks["use_audio"].isChecked(),
