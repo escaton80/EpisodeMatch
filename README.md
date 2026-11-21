@@ -1,5 +1,5 @@
 🚨 **PLEASE READ BEFORE DOWNLOADING (Early Beta & Manage Your Expectations):**
-This is **v0.11.4 — an early, experimental beta**, and **I really don't want to overpromise here!** Please **only download this if you enjoy testing raw, early software and fully expect that things might fail or not work on your setup.**
+This is **v0.12.0 — an early, experimental beta**, and **I really don't want to overpromise here!** Please **only download this if you enjoy testing raw, early software and fully expect that things might fail or not work on your setup.**
 * **Your mileage WILL vary:** While I had successful test runs on my own discs, a lot of the matching logic (especially the subtitle comparison) is still heavily based on theory. Just because it worked on my test rips does **not** mean you will automatically get the same results on yours!
 * **USE AT YOUR OWN RISK — NO GUARANTEES:** Even though the renamer has an undo journal, **DO NOT run this on video files you don't have a backup of** (or can't easily re-rip). Always test on a backup copy first! I take zero responsibility for mangled filenames or broken MKV headers.
 
@@ -21,10 +21,12 @@ then renames the files into Plex/Jellyfin/Emby layout (with an undo journal), wr
 episode titles into the MKV header, and optionally cleans tracks or queues the results
 for AV1 encoding.
 
-> **Status: early public beta (v0.11.4).** The **Disc DB** and **Subtitles** pillars are
-> production-ready and are what the tool is built around. Everything else (Audio/Whisper,
-> Title-card OCR, LLM arbiter, the Visual Verify and Post-Processing pages) is
-> **explicitly not ready** and marked as such inside the app. See
+> **Status: early public beta (v0.12.0).** The **Disc DB**, **Subtitles** and
+> **Title-card OCR** pillars are ready for testing and are what the tool is built around
+> (the OCR pillar assigns **70–90 % of episodes** when the show displays its episode
+> titles on screen).
+> Everything else (Audio/Whisper, LLM arbiter, the Visual Verify and Post-Processing
+> pages) is **explicitly not ready** and marked as such inside the app. See
 > [Status](#status-whats-ready-and-whats-not).
 
 | Workspace | Settings |
@@ -64,7 +66,7 @@ All of them can be entered in the GUI's **Settings** page.
 | **Subtitles** (extract + reference matching) | ✅ **ready** | Extracts the file's subtitles, matches the dialog against reference subtitles |
 | Rename / MKV tagging | ✅ **ready** | Plex-layout renaming with undo journal, `mkvpropedit` title writing |
 | Audio / Whisper | 🚧 not ready | Local Whisper transcription of two audio windows |
-| Title-card OCR | 🚧 not ready | Reads title cards / credits from keyframes |
+| **Title-card OCR** | ✅ **ready** (v0.12.0) | Reads title cards / credits from keyframes and matches them against the TMDB guide — assigns **70–90 % of episodes** when the show displays its episode titles on screen |
 | LLM arbiter | 🚧 not ready | Sends all evidence to an LLM for a global assignment |
 | Visual Verify page | 🚧 beta | Synchronized frame comparison across all files |
 | Post-Processing page | 🚧 beta | Track cleanup + SVT-AV1 encoding queue |
@@ -197,6 +199,59 @@ All evidence is combined per (file, episode); a Hungarian-algorithm assignment
 assigned twice**. Assignments below the confidence threshold are reported as *unassigned*
 with their best guess instead of being guessed silently.
 
+## Pillar 4 — Title-card OCR: how the frame matching works
+
+The title-card pillar answers *"what does the video itself say about this episode?"*
+Many shows print the **episode title on screen** (a title card right after the opening,
+typically around the end of the first chapter), and the credit rolls name **directors,
+writers and guest stars**. Both are read from keyframes and matched against the TMDB
+season guide.
+
+> **The one requirement:** the episode title must actually be **displayed on screen**.
+> Shows that use title cards (most pre-2000 DVD productions, …) get the full benefit —
+> in tests the pillar assigns **70–90 % of episodes on its own** (9/11 files resolved
+> from title cards alone, no DiscDB entry, no subtitle references). If a show never
+> displays its episode titles, pillar 4 cannot discriminate the episodes by title — it
+> can still corroborate through credit names (director/writer/guest matches) and
+> confirm the series choice via main-cast cards, but a title-less show relies on the
+> DiscDB and Subtitle pillars.
+
+### What is scanned
+
+- **Title window** (first minutes of the file): a 2.5 s probe grid — **densified to
+  1 s steps in ±10 s zones around every MKV chapter mark**, because the title card
+  typically sits right around the end of the first chapter. Scene cuts are always
+  probed as well; the title window is never frame-capped, so a slow fade-in title
+  is not lost.
+- **Credits tail**: uniformly sampled across the rolling credits (the end credits
+  name this episode's directors, writers and guest stars).
+
+### Reading the frames
+
+- **Dual OCR backends**: the OCR built into Windows (WinRT) plus
+  [RapidOCR](https://github.com/RapidAI/RapidOCR) as the second engine — selectable
+  via `extraction.ocr_backend` in the config. RapidOCR reads stylized/title fonts
+  noticeably better (0.92–0.99 confidence where WinRT
+  misread them).
+- **Grayscale retry**: a frame that reads empty or noise-only is re-OCRed on a
+  grayscale-contrast variant before it is given up on.
+
+### Matching against the guide
+
+- **Episode title vs card text**: normalized fuzzy match with four guards learned
+  from real discs — the series logo on every card is filtered out (it partial-matches
+  title-like episode names), next-episode teaser cards in the credit tail are ignored,
+  short titles need a near-exact full-line match, and OCR spacing quirks are
+  normalized (`"THE37's` and `The 37's` both normalize to the same text).
+- **On-screen names vs TMDB credits**: directors, writers and guest stars are matched
+  fuzzily; a name credited in *many* season episodes fades via a normalized season-IDF
+  so showrunners credited everywhere cannot dominate the score.
+- **Series-cast hints**: a main-cast name on a card (prints only last names like —
+  "PICARDO") confirms the series choice as evidence, without contributing episode
+  score.
+- Every hit becomes timestamped evidence (`Title card 'PROTOTYPE' matches episode
+  title (100 %)`), so every assignment stays auditable in the evidence inspector.
+
 ## Step-by-step usage
 
 ### GUI
@@ -264,11 +319,14 @@ machine, keeping the archives GPL-clean).
 
 ## Status: what's ready and what's not
 
-This is the **early public beta (v0.11.4)**. Pillar 1 and 2 are production-ready and were
-validated against real rips (South Park S6D1: 9/9 at 100 %; Castle Rock S1D2: 5/5 at
-80 %; The Walking Dead S1D1 and The Americans S1D1 — 4/4 at 93 % — with live SubDL
-references). Everything else is present but
-**not ready**: Audio/Whisper, Title-card OCR and the LLM arbiter are marked *not ready*
+This is the **early public beta (v0.12.0)**. Pillars 1, 2 and 4 are ready for testing and
+were validated against real rips (DVD test sets: **9/11 files assigned from title cards
+alone** — no DiscDB entry, no subtitle references — plus stylized title fonts calibrated).
+For shows that display their episode titles, the title-card pillar assigns
+**70–90 % of episodes on its own**; shows that never display titles rely on the DiscDB
+and Subtitle pillars.
+Everything else is present but
+**not ready**: Audio/Whisper and the LLM arbiter are marked *not ready*
 in the pillar checkboxes; the Visual Verify and Post-Processing pages are marked *beta*
 and show an in-page warning banner. Treat them as previews — do not rely on their
 results.
@@ -306,8 +364,9 @@ Begründung — und benennt sie anschließend Plex/Jellyfin/Emby-gerecht um (mit
 Undo-Journal), schreibt den Episodentitel per `mkvpropedit` in den MKV-Header und kann
 optional Spuren bereinigen oder für AV1-Encoding in eine Warteschlange stellen.
 
-> **Status: frühe öffentliche Beta (v0.11.4).** Die Säulen **Disc DB** und **Subtitles**
-> sind produktionsreif. Alles andere (Audio/Whisper, Title-card OCR, LLM arbiter, die
+> **Status: frühe öffentliche Beta (v0.12.0).** Die Säulen **Disc DB**, **Subtitles** und
+> **Title-card OCR** sind bereit für Tests — die OCR-Säule ordnet **70–90 % der Folgen**
+> zu, wenn die Serie ihre Episodentitel einblendet. Alles andere (Audio/Whisper, LLM arbiter, die
 > Seiten Visual Verify und Post-Processing) ist **bewusst noch nicht fertig** und ist im
 > Programm entsprechend markiert.
 
@@ -372,6 +431,30 @@ nummerierte die Playlists anders → **5/5 korrekt @ 80 %** über die eindeutige
    Episode wird doppelt vergeben; alles unter der Confidence-Schwelle wird ehrlich als
    *unassigned* mit Best-Guess gemeldet.
 
+## Säule 4 — Title-card OCR (neu in v0.12.0)
+
+Viele Serien blenden den **Episodentitel auf dem Bildschirm** ein (Title-Card nach dem
+Opening, typischerweise um das Ende des ersten Kapitels), und der Abspann nennt
+**Regisseure, Autoren und Gaststars** — beides wird aus Keyframes gelesen und gegen den
+TMDB-Staffel-Guide gematcht.
+
+> **Die eine Voraussetzung:** der Episodentitel muss **auf dem Bildschirm erscheinen**.
+> Serien mit Title-Cards (die meisten DVD-Produktionen vor 2000, …) bekommen den vollen Nutzen — live ordnet die Säule
+> **70–90 % der Folgen allein** zu (in Tests 9/11 Dateien aus Title-Cards allein,
+> ohne DiscDB-Eintrag und ohne Untertitel-Referenzen). Serien, die ihre Titel nie
+> einblenden, können über diese Säule nicht nach Episoden unterschieden werden — sie
+> bestätigt dann nur die Serie (Hauptcast-Cards) und liefert schwache Credit-Hinweise;
+> solche Shows verlassen sich auf die DiscDB- und Subtitles-Säulen.
+
+Im Detail: Probe-Raster im Titel-Fenster (2,5-s-Raster, in ±10-s-Zonen um jede
+MKV-Kapitelmarke auf 1 s verdichtet), gleichmäßiges Sampling im Abspann; zwei
+OCR-Backends (Windows-WinRT + RapidOCR, wählbar; RapidOCR liest stilisierte Fonts
+deutlich besser) mit Graustufen-Retry bei leeren Frames; Titel-Abgleich mit vier Guards
+aus echten Discs (Serienlogo-Filter, Teaser-Card-Filter im Abspann, Kurz-Titel-Schutz,
+OCR-Abstands-Normalisierung); Credit-Namen mit Staffel-IDF (in vielen Folgen
+Genannte verblassen); Serien-Cast-Hinweise als Evidence ohne Episoden-Score. Jeder
+Treffer wird mit Timestamp als Evidence protokolliert.
+
 ## Schritt für Schritt (GUI)
 
 1. **Workspace** → Seriennamen eingeben → *Search TMDB* → Serie wählen, Staffel setzen.
@@ -384,10 +467,10 @@ nummerierte die Playlists anders → **5/5 korrekt @ 80 %** über die eindeutige
 
 ## Was noch nicht fertig ist
 
-🚧 **Audio/Whisper**, 🚧 **Title-card OCR**, 🚧 **LLM arbiter** (in den Checkboxen als
-*not ready* markiert) sowie die Seiten 🚧 **Visual Verify** und 🚧 **Post-Processing**
-(*beta* in der Navigation + Warnbanner). Vorhanden, aber als Vorschau behandeln — bitte
-nicht auf ihre Ergebnisse verlassen.
+🚧 **Audio/Whisper** und 🚧 **LLM arbiter** (in den Checkboxen als *not ready* markiert)
+sowie die Seiten 🚧 **Visual Verify** und 🚧 **Post-Processing** (*beta* in der Navigation
++ Warnbanner). Vorhanden, aber als Vorschau behandeln — bitte nicht auf ihre Ergebnisse
+verlassen. ✅ **Title-card OCR** ist seit v0.12.0 reif für weitere Tests.
 
 ## Installation & Tools
 

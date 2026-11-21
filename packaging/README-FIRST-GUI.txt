@@ -39,8 +39,11 @@ FIRST RUN - everything is configured inside the app (Settings page)
 
 Full documentation: https://github.com/escaton80/EpisodeMatch#readme
 
-Status: early public beta. Disc DB + Subtitles pillars are production-ready;
-Audio/Whisper, Title-card OCR, LLM arbiter, Visual Verify and Post-Processing
+Status: early public beta. Disc DB + Subtitles + Title-card OCR pillars are
+ready for testing - the OCR pillar assigns 70-90% of episodes when the show
+displays its episode titles on screen (a show that never shows titles cannot
+be told apart by it and relies on the DiscDB/Subtitle pillars).
+Audio/Whisper, LLM arbiter, Visual Verify and Post-Processing
 are marked not ready / beta inside the app.
 
 MIT License - https://github.com/escaton80/EpisodeMatch
